@@ -907,7 +907,9 @@ impl JellyfinClient {
     pub fn resolve_url(&self, path: &str) -> String {
         let s = self.session();
         let (url, _) = s.url_headers.as_ref().expect("Client not initialized");
-        url.join(path.trim_start_matches('/')).unwrap().to_string()
+        url.join(url_relative_to_base(url.path(), path))
+            .unwrap()
+            .to_string()
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1576,6 +1578,23 @@ impl JellyfinClient {
     }
 }
 
+/// Returns `path` relative to the server base path, so it can be joined onto
+/// the session URL. Some servers (and proxies in front of them, e.g.
+/// emos/Meridian) hand out paths that already contain the base path: with a
+/// base of `https://host/emby/`, `"/emby/emya/subtitle?..."` must not become
+/// `/emby/emby/emya/subtitle?...`, which answers 404.
+fn url_relative_to_base<'a>(base_path: &str, path: &'a str) -> &'a str {
+    let base_path = base_path.trim_matches('/');
+    let trimmed = path.trim_start_matches('/');
+
+    match trimmed.strip_prefix(base_path) {
+        Some(rest) if !base_path.is_empty() && (rest.is_empty() || rest.starts_with('/')) => {
+            rest.trim_start_matches('/')
+        }
+        _ => trimmed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1583,6 +1602,33 @@ mod tests {
         account::ServerType,
         error::UserFacingError,
     };
+
+    #[test]
+    fn relative_url_does_not_duplicate_the_base_path() {
+        // emos/Emya signed subtitle URLs already carry the /emby base path
+        assert_eq!(
+            url_relative_to_base("/emby/", "/emby/emya/subtitle?server=emos"),
+            "emya/subtitle?server=emos"
+        );
+        assert_eq!(
+            url_relative_to_base("/emby/", "emby/emya/subtitle"),
+            "emya/subtitle"
+        );
+        // regular server paths must keep the base path
+        assert_eq!(
+            url_relative_to_base("/emby/", "/emya/video?server=emos"),
+            "emya/video?server=emos"
+        );
+        assert_eq!(
+            url_relative_to_base("/", "/Videos/1/stream.mkv"),
+            "Videos/1/stream.mkv"
+        );
+        // absolute URLs are left alone
+        assert_eq!(
+            url_relative_to_base("/emby/", "https://cdn.example/x.ass"),
+            "https://cdn.example/x.ass"
+        );
+    }
 
     #[tokio::test]
     async fn search() {

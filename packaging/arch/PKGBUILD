@@ -1,0 +1,82 @@
+# Maintainer: binaryu <binaryu@users.noreply.github.com>
+# Fork build of tsukimi (GTK4 Jellyfin/Emby client).
+#
+# Build from a local checkout instead of GitHub:
+#   TSUKIMI_SRC="file://$PWD/../.." makepkg -si
+# Override the remote/branch (defaults to the fork's main):
+#   TSUKIMI_SRC=https://github.com/binaryu/tsukimi.git TSUKIMI_BRANCH=main makepkg -si
+
+pkgname=tsukimi-fork-git
+pkgver=26.10.1.r0.gdeadbee
+pkgrel=1
+# earlier builds of this fork shipped without an epoch; bump once so they stay
+# upgradable even when a squashed history lowers the commit count
+epoch=1
+pkgdesc='A simple Jellyfin/Emby client (GTK4) - fork build using the server-signed DirectStreamUrl'
+arch=('x86_64')
+url='https://github.com/binaryu/tsukimi'
+license=('GPL-3.0-or-later')
+depends=(
+    'gtk4'
+    'libadwaita'
+    'gstreamer'
+    'gst-plugins-base'
+    'gst-plugins-good'
+    'gst-plugins-bad'
+    'mpv'
+    'ffmpeg'
+    'libepoxy'
+    'openssl'
+    'dbus'
+    'glib2'
+    'hicolor-icon-theme'
+)
+makedepends=(
+    'git'
+    'meson'
+    'ninja'
+    'rust'
+    'cargo'
+    'cmake'            # aws-lc-sys (rustls) builds its C sources with cmake
+    'blueprint-compiler'
+    'python'
+    'gettext'
+    'pkgconf'
+    'desktop-file-utils'
+)
+provides=('tsukimi')
+conflicts=('tsukimi' 'tsukimi-git')
+options=('!lto' '!debug')
+_src=${TSUKIMI_SRC:-https://github.com/binaryu/tsukimi.git}
+_branch=${TSUKIMI_BRANCH:-main}
+source=("tsukimi::git+${_src}#branch=${_branch}")
+sha256sums=('SKIP')
+
+pkgver() {
+    cd tsukimi
+    local base count
+    base=$(sed -n 's/^version = "\(.*\)"/\1/p' crates/tsukimi/Cargo.toml | head -1)
+    count=$(git rev-list --count HEAD)
+    printf '%s.r%s.g%s' "$base" "$count" "$(git rev-parse --short=7 HEAD)"
+}
+
+build() {
+    cd tsukimi
+    # aws-lc-sys (pulled in by rustls) is C code that ends up in the Rust link.
+    # GCC LTO objects cannot be linked by rust-lld, which shows up as a flood of
+    # "undefined symbol: aws_lc_0_46_0_*" errors. Drop LTO from the C flags; the
+    # '!lto' option alone does not help when the distro hardcodes -flto in
+    # CFLAGS (e.g. CachyOS).
+    CFLAGS=$(sed -E 's/-flto(=auto|=thin|=1)?//g' <<<"$CFLAGS")
+    CXXFLAGS=$(sed -E 's/-flto(=auto|=thin|=1)?//g' <<<"$CXXFLAGS")
+    export CFLAGS CXXFLAGS
+
+    arch-meson . build -Drust-target=release
+    meson compile -C build
+}
+
+package() {
+    cd tsukimi
+    meson install -C build --no-rebuild --destdir "$pkgdir"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+}

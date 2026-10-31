@@ -593,6 +593,10 @@ impl MutsumiVideoSink {
         self.mpv().add_sub(url);
     }
 
+    pub fn add_sub_track(&self, url: &str, title: &str, language: &str) {
+        self.mpv().add_sub_track(url, title, language);
+    }
+
     pub fn set_position(&self, position: f64) {
         self.mpv().set_position(position);
     }

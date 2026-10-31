@@ -1,0 +1,5 @@
+src/
+pkg/
+tsukimi/
+*.pkg.tar.zst
+*.tar.gz

@@ -109,6 +109,10 @@ impl MPVPlaySink {
         self.player().add_sub(url)
     }
 
+    pub fn add_sub_track(&self, url: &str, title: &str, language: &str) {
+        self.player().add_sub_track(url, title, language)
+    }
+
     pub fn seek_forward(&self, value: i64) {
         self.player().seek_forward(value)
     }

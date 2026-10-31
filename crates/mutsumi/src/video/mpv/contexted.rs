@@ -103,6 +103,12 @@ impl ContextedMPV {
         self.mpv.command("sub-add", &[url, "select"]);
     }
 
+    /// Add an external subtitle without selecting it, so it only shows up in the
+    /// track menu.
+    pub fn add_sub_track(&self, url: &str, title: &str, language: &str) {
+        self.mpv.command("sub-add", &[url, "auto", title, language]);
+    }
+
     pub fn load_video(&self, url: &str) {
         // mpv will read "WAYLAND_DISPLAY" everytime on loading file
         arm_mpv_proxy();

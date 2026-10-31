@@ -1,0 +1,74 @@
+name: Arch
+on:
+  workflow_call:
+
+jobs:
+  package:
+    name: Package (archlinux)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    container:
+      image: archlinux:base-devel
+
+    steps:
+      - name: Install build dependencies
+        run: |
+          pacman -Syu --noconfirm --needed \
+            git meson ninja rust cmake blueprint-compiler python gettext pkgconf \
+            desktop-file-utils gtk4 libadwaita gstreamer gst-plugins-base \
+            gst-plugins-good gst-plugins-bad mpv ffmpeg libepoxy openssl dbus glib2
+          useradd -m builder
+          su builder -c 'git config --global --add safe.directory "*"'
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+          # pkgver() counts commits
+          fetch-depth: 0
+
+      - name: makepkg
+        run: |
+          chown -R builder:builder "$GITHUB_WORKSPACE"
+          su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && \
+            TSUKIMI_SRC='file://$GITHUB_WORKSPACE' makepkg -f --noconfirm"
+
+      - name: Verify package
+        run: |
+          cd packaging/arch
+          # skip the detached debug package (built when the distro makepkg.conf
+          # enables the debug option) and drop the epoch from the asset name,
+          # pacman reads it from .PKGINFO anyway
+          pkgfile=$(ls -t *.pkg.tar.zst | grep -v -- '-debug-' | head -1)
+          if [[ $pkgfile == *:* ]]; then
+            mv "$pkgfile" "${pkgfile//:/_}"
+            pkgfile=$(ls -t *.pkg.tar.zst | grep -v -- '-debug-' | head -1)
+          fi
+          echo "pkgfile=$pkgfile" >> "$GITHUB_ENV"
+
+          # no pacman here, just the package metadata: it has to be a drop-in
+          # replacement and carry the payload
+          bsdtar -xOf "$pkgfile" .PKGINFO | sed -n '1,6p'
+          bsdtar -xOf "$pkgfile" .PKGINFO | grep -qx 'pkgname = tsukimi-fork-git'
+          bsdtar -tf "$pkgfile" | grep -qx 'usr/bin/tsukimi'
+          bsdtar -tf "$pkgfile" | grep -qx 'usr/share/tsukimi/tsukimi.gresource'
+
+          du -h "$pkgfile" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: tsukimi-archlinux-x86_64
+          path: packaging/arch/${{ env.pkgfile }}
+          archive: false
+          if-no-files-found: error
+
+      - name: Summary
+        run: |
+          {
+            echo "### ${{ env.pkgfile }}"
+            echo
+            echo '```'
+            echo "sudo pacman -U ${{ env.pkgfile }}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"

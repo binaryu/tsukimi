@@ -75,6 +75,15 @@ enum MpvTrackKind {
     Subtitle,
 }
 
+/// An external subtitle served by the media server (`DeliveryUrl`), e.g. the
+/// signed `/emya/subtitle` URLs used by emos/Emya. These are not part of the
+/// container, so they have to be handed to mpv explicitly.
+pub struct ExternalSubtitle {
+    pub url: String,
+    pub title: String,
+    pub language: String,
+}
+
 impl MpvTrackKind {
     fn track_kind(self) -> TrackKind {
         match self {
@@ -213,6 +222,7 @@ mod imp {
         pub y: Cell<f64>,
         pub last_motion_time: Cell<i64>,
         pub suburl: RefCell<Option<String>>,
+        pub external_subtitles: RefCell<Vec<ExternalSubtitle>>,
         pub(super) media_source_fallback: RefCell<Option<MediaSourceFallback>>,
         pub skippable_segments: RefCell<Option<Vec<MediaSegment>>>,
         pub current_segment_end: Cell<Option<f64>>,
@@ -815,7 +825,7 @@ impl MPVPage {
 
                 let media_stream =
                     if let Some(sub_stream_index) = selected.as_ref().map(|s| s.sub_index) {
-                        media_source.media_streams.get(sub_stream_index as usize)
+                        media_stream_by_index(media_source, sub_stream_index)
                     } else {
                         let sub_version_list: Vec<_> = media_source
                             .media_streams
@@ -830,7 +840,7 @@ impl MPVPage {
                             .collect();
 
                         make_subtitle_version_choice(sub_version_list)
-                            .and_then(|index| media_source.media_streams.get(index.0 as usize))
+                            .and_then(|(index, _)| media_stream_by_index(media_source, index))
                     };
 
                 if let Some(slang) = selected.map(|s| s.sub_lang) {
@@ -857,6 +867,28 @@ impl MPVPage {
                     _ => None,
                 };
 
+                let extra_subtitles = media_source
+                    .media_streams
+                    .iter()
+                    .filter(|stream| stream.is_external)
+                    .filter_map(|stream| {
+                        let url = JELLYFIN_CLIENT.resolve_url(stream.delivery_url.as_deref()?);
+                        if Some(&url) == sub_url.as_ref() {
+                            return None;
+                        }
+                        Some(ExternalSubtitle {
+                            url,
+                            title: stream
+                                .title
+                                .to_owned()
+                                .or_else(|| stream.display_title.to_owned())
+                                .unwrap_or_default(),
+                            language: stream.language.to_owned().unwrap_or_default(),
+                        })
+                    })
+                    .collect();
+
+                imp.external_subtitles.replace(extra_subtitles);
                 imp.suburl.replace(sub_url);
 
                 let Some((primary_url, fallback)) =
@@ -983,11 +1015,8 @@ impl MPVPage {
             .iter()
             .find(|source| source.id == media_source_id_clone);
 
-        let url = media_source?
-            .media_streams
-            .get(stream_index as usize)?
-            .delivery_url
-            .to_owned()?;
+        let url = media_stream_by_index(media_source?, stream_index)
+            .and_then(|stream| stream.delivery_url.to_owned())?;
 
         Some(JELLYFIN_CLIENT.resolve_url(&url))
     }
@@ -1313,6 +1342,10 @@ impl MPVPage {
 
         if let Some(suburl) = imp.suburl.borrow().as_ref() {
             imp.video.add_sub(suburl);
+        }
+        for subtitle in imp.external_subtitles.take() {
+            imp.video
+                .add_sub_track(&subtitle.url, &subtitle.title, &subtitle.language);
         }
         self.notify_playing();
         self.update_timeout();
@@ -1941,6 +1974,23 @@ impl MPVPage {
     }
 }
 
+/// `MediaStream.Index` is the index the server assigned to the stream and is not
+/// a position inside `MediaStreams`: external subtitles are appended to the list
+/// but keep the next free index (e.g. 13 in a six stream file), so looking them
+/// up by position picks the wrong entry or nothing at all. Match on the index and
+/// only fall back to the position for servers that do behave like that.
+fn media_stream_by_index(source: &MediaSource, index: i64) -> Option<&MediaStream> {
+    source
+        .media_streams
+        .iter()
+        .find(|stream| stream.index == index)
+        .or_else(|| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| source.media_streams.get(index))
+        })
+}
+
 fn direct_play_url(source: &MediaSource, play_session_id: Option<&str>) -> Option<String> {
     let container = source.container.as_deref()?;
     JELLYFIN_CLIENT
@@ -1951,6 +2001,22 @@ fn direct_play_url(source: &MediaSource, play_session_id: Option<&str>) -> Optio
             play_session_id,
         )
         .ok()
+}
+
+/// Servers such as the emos proxy only serve signed, server-generated stream
+/// URLs: a self-built `Videos/{id}/stream.{container}` request always answers
+/// 404. Such URLs carry their own credentials (`token`/`sign`), which is
+/// required anyway since mpv gets no auth headers. Plain Jellyfin/Emby
+/// `DirectStreamUrl` values without credentials are ignored so the regular
+/// URL builder keeps being used for them.
+fn signed_direct_stream_url(source: &MediaSource) -> Option<String> {
+    let url = source.direct_stream_url.as_deref()?.trim();
+    [
+        "api_key=", "ApiKey=", "apiKey=", "token=", "Token=", "sign=",
+    ]
+    .iter()
+    .any(|needle| url.contains(needle))
+    .then(|| url.to_owned())
 }
 
 fn media_source_url(
@@ -1966,5 +2032,13 @@ fn media_source_url(
         };
         return Some((path.to_owned(), fallback));
     }
+
+    if let Some(url) = signed_direct_stream_url(source) {
+        // Keep the regular URL builder around as a second chance.
+        let fallback =
+            direct_play_url(source, play_session_id).map(MediaSourceFallback::DirectPlay);
+        return Some((url, fallback));
+    }
+
     direct_play_url(source, play_session_id).map(|url| (url, None))
 }

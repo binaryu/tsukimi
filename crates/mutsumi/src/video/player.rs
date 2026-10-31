@@ -216,6 +216,10 @@ impl MutsumiVideoPlayer {
         self.backend_ref().add_sub(url);
     }
 
+    pub fn add_sub_track(&self, url: &str, title: &str, language: &str) {
+        self.backend_ref().add_sub_track(url, title, language);
+    }
+
     pub fn pause(&self, pause: bool) {
         self.backend_ref().pause(pause);
     }

@@ -26,6 +26,10 @@ on:
 permissions:
   contents: write
 
+concurrency:
+  group: build-${{ github.ref }}
+  cancel-in-progress: ${{ github.ref_type != 'tag' }}
+
 jobs:
   lint:
     name: Lint
@@ -37,9 +41,14 @@ jobs:
     uses: ./.github/workflows/build_linux.yml
     secrets: inherit
 
+  arch:
+    name: Arch
+    uses: ./.github/workflows/build_arch.yml
+    secrets: inherit
+
   artifacts:
     name: Artifacts
     if: ${{ github.event_name != 'pull_request' }}
     uses: ./.github/workflows/artifacts.yml
-    needs: [linux]
+    needs: [linux, arch]
     secrets: inherit
