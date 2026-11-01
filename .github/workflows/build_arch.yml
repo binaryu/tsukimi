@@ -30,8 +30,15 @@ jobs:
       - name: makepkg
         run: |
           chown -R builder:builder "$GITHUB_WORKSPACE"
+          # On a tag the checkout is a detached HEAD and no branch ref exists, so
+          # the PKGBUILD's `#branch=main` cannot be resolved when makepkg clones
+          # the workspace ("fatal: invalid reference: origin/main"). Point a
+          # dedicated branch at whatever was checked out and use that instead, so
+          # the package builds the same way from a branch and from a tag.
+          su builder -c "git -C '$GITHUB_WORKSPACE' branch -f makepkg-src HEAD"
           su builder -c "cd '$GITHUB_WORKSPACE/packaging/arch' && \
-            TSUKIMI_SRC='file://$GITHUB_WORKSPACE' makepkg -f --noconfirm"
+            TSUKIMI_SRC='file://$GITHUB_WORKSPACE' TSUKIMI_BRANCH=makepkg-src \
+            makepkg -f --noconfirm"
 
       - name: Verify package
         run: |
