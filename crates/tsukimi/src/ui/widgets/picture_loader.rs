@@ -4,7 +4,7 @@ use super::image_paintable::paintable_from_file;
 use crate::{
     client::picture_source::PictureSource,
     utils::{
-        resolve_picture_file,
+        resolve_picture_file_scaled,
         spawn,
     },
 };
@@ -217,9 +217,12 @@ impl PictureLoader {
 
     fn load_source(&self, source: PictureSource) {
         let load_token = self.new_request();
+        // Ask for crisp pixels on HiDPI screens instead of upscaling a 300 px
+        // thumbnail.
+        let scale = self.scale_factor().max(1) as u32;
         let weak_self = self.downgrade();
         spawn(async move {
-            let paintable = Self::load_paintable(load_token.clone(), source).await;
+            let paintable = Self::load_paintable(load_token.clone(), source, scale).await;
             let Some(obj) = weak_self.upgrade() else {
                 return;
             };
@@ -254,7 +257,7 @@ impl PictureLoader {
     }
 
     async fn load_paintable(
-        load_token: LoadToken, source: PictureSource,
+        load_token: LoadToken, source: PictureSource, scale: u32,
     ) -> Result<gdk::Paintable> {
         if load_token.is_cancelled() {
             bail!("image load cancelled");
@@ -267,7 +270,7 @@ impl PictureLoader {
             }
         }
 
-        let file = resolve_picture_file(source).await?;
+        let file = resolve_picture_file_scaled(source, scale).await?;
         if load_token.is_cancelled() {
             bail!("image load cancelled");
         }

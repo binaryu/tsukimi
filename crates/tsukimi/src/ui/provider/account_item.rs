@@ -11,9 +11,12 @@ use gtk::{
     },
 };
 
-use crate::client::{
-    Account,
-    account::ServerType,
+use crate::{
+    client::{
+        Account,
+        account::ServerType,
+    },
+    ui::models::SETTINGS,
 };
 
 pub mod imp {
@@ -72,6 +75,17 @@ impl AccountItem {
     }
 
     pub fn account(&self) -> Account {
+        // The compatibility profile (resolved base URL, authorization dialect,
+        // capabilities, server lines) is derived state that lives in SETTINGS,
+        // not on this model. Restore it here, otherwise every "open this server"
+        // drops it and the client re-probes the whole server on entry.
+        let servername = self.servername();
+        let profile = SETTINGS
+            .accounts()
+            .into_iter()
+            .find(|account| account.servername == servername)
+            .and_then(|account| account.profile);
+
         Account {
             server: self.server(),
             servername: self.servername(),
@@ -81,7 +95,7 @@ impl AccountItem {
             user_id: self.user_id(),
             access_token: self.access_token(),
             server_type: Some(ServerType::from_index(self.server_type())),
-            profile: None,
+            profile,
         }
     }
 }

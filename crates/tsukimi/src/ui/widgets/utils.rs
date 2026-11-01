@@ -85,10 +85,27 @@ where
     T: IsA<gtk::Widget>,
 {
     fn toast(&self, message: impl Into<String>) {
+        let message = message.into();
+
+        // A broken server (expired token, dead line) fails every concurrent
+        // request at once; a dozen identical toasts help nobody.
+        {
+            static LAST: std::sync::Mutex<Option<(String, std::time::Instant)>> =
+                std::sync::Mutex::new(None);
+            let mut last = LAST.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some((previous, at)) = last.as_ref()
+                && *previous == message
+                && at.elapsed() < std::time::Duration::from_secs(5)
+            {
+                return;
+            }
+            *last = Some((message.clone(), std::time::Instant::now()));
+        }
+
         let toast = adw::Toast::builder()
             .timeout(2)
             .use_markup(false)
-            .title(message.into())
+            .title(message)
             .build();
         self.add_toast_inner(toast);
     }

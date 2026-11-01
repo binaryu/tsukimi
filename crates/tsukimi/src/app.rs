@@ -159,12 +159,34 @@ mod imp {
             init.set_option("input-vo-keyboard", true)?;
             init.set_option("input-default-bindings", true)?;
 
-            if SETTINGS.mpv_config() {
+            // An explicit `set_option` before `mpv_initialize` behaves like a
+            // command line option and *beats* the config file, so seeding a value
+            // here permanently hides the user's mpv.conf for that key. Options the
+            // app itself manages (subtitle style, cache sizes, upscaling, …) stay
+            // authoritative - they all have UI rows, and "the setting I just
+            // changed does nothing" is worse than "edit it in the app".
+            let external_config = SETTINGS.mpv_config();
+            if external_config {
                 init.set_option("config", true)?;
-                init.set_option("config-dir", SETTINGS.mpv_config_dir().as_str())?;
+
+                // Only pin the directory when the user picked one; otherwise let
+                // mpv use its own default (`$XDG_CONFIG_HOME/mpv`), so enabling
+                // the switch alone is enough to pick up an existing mpv.conf.
+                let configured = SETTINGS.mpv_config_dir();
+                let configured = configured.trim();
+                if !configured.is_empty() && configured != "None" {
+                    init.set_option("config-dir", configured)?;
+                }
             }
 
-            init.set_option("hwdec", match_hwdec_interop(SETTINGS.mpv_hwdec()))?;
+            // Decoding and frame timing are the knobs people tune by hand, and
+            // the UI either exposes them at runtime (`hwdec` via the player
+            // sidebar) or not at all, so leave them to mpv.conf when it is read.
+            if !external_config {
+                init.set_option("hwdec", match_hwdec_interop(SETTINGS.mpv_hwdec()))?;
+                init.set_option("video-sync", "audio")?;
+                init.set_option("video-timing-offset", 0_i64)?;
+            }
 
             match SETTINGS.mpv_renderer() {
                 1 => {
@@ -174,6 +196,8 @@ mod imp {
                     init.set_option("gpu-context", "wayland")?;
                 }
                 3 => {
+                    // The software path needs frames in system memory, whatever
+                    // the config file says.
                     init.set_option("vo", "wlshm")?;
                     init.set_option("hwdec", "auto-copy-safe")?;
                 }
@@ -181,8 +205,6 @@ mod imp {
             }
 
             init.set_option("user-agent", crate::USER_AGENT.as_str())?;
-            init.set_option("video-timing-offset", 0_i64)?;
-            init.set_option("video-sync", "audio")?;
             init.set_option("osc", false)?;
             init.set_option("osd-level", 0_i64)?;
 

@@ -88,8 +88,8 @@
       <summary>Default mpv-cache-time</summary>
     </key>
     <key name="threads" type="i">
-      <default>1</default>
-      <summary>Default threads</summary>
+      <default>8</default>
+      <summary>Concurrent API requests per host</summary>
     </key>
     <key name="pic-opacity" type="i">
       <default>15</default>

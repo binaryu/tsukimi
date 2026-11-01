@@ -245,10 +245,18 @@ where
 }
 
 pub async fn resolve_picture_file(source: PictureSource) -> Result<gio::File> {
+    resolve_picture_file_scaled(source, 1).await
+}
+
+/// Like [`resolve_picture_file`], but requests the image at a size suitable for
+/// the given physical pixel ratio (`gtk::Widget::scale_factor`).
+pub async fn resolve_picture_file_scaled(source: PictureSource, scale: u32) -> Result<gio::File> {
     match source {
         PictureSource::Url { url, .. } => Ok(gio::File::for_uri(&url)),
         source => {
-            let path = spawn_tokio(async move { JELLYFIN_CLIENT.get_image(source).await }).await?;
+            let path =
+                spawn_tokio(async move { JELLYFIN_CLIENT.get_image_scaled(source, scale).await })
+                    .await?;
             Ok(gio::File::for_path(path))
         }
     }

@@ -35,8 +35,10 @@ use super::{
     structs::PublicServerInfo,
 };
 
-/// Probes must never make account switching feel slow.
-pub const PROBE_TIMEOUT: Duration = Duration::from_secs(4);
+/// Probes must never make account switching feel slow: they are an
+/// optimisation, and a server that does not answer an *optional* endpoint must
+/// not cost more than this.
+pub const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Which server implementation we are talking to.
 ///
@@ -266,20 +268,24 @@ pub async fn resolve_base(client: &Client, raw: &str, hint: ServerType) -> Resul
         return Err(anyhow!("not a valid server address: {raw}"));
     }
 
-    let mut last_error = None;
-    for candidate in candidates {
-        match probe(client, &candidate).await {
+    // Race the candidates instead of trying them one after another: a stale
+    // first candidate used to cost a full timeout before the right one was even
+    // attempted, which is exactly what made the first open of a server feel slow.
+    let probes = candidates.into_iter().map(|candidate| {
+        Box::pin(async move {
             // `base` may differ from `candidate`: reverse proxies frequently
             // redirect `/System/Info/Public` to their canonical mount point.
-            Ok((base, info)) => return Ok(ResolvedBase { base, info }),
-            Err(e) => {
-                tracing::debug!("probe {candidate} failed: {e}");
-                last_error = Some(e);
-            }
-        }
-    }
+            probe(client, &candidate)
+                .await
+                .map(|(base, info)| ResolvedBase { base, info })
+                .inspect_err(|e| tracing::debug!("probe {candidate} failed: {e}"))
+        })
+    });
 
-    Err(last_error.unwrap_or_else(|| anyhow!("no reachable Emby/Jellyfin endpoint")))
+    match futures_util::future::select_ok(probes).await {
+        Ok((resolved, _slower)) => Ok(resolved),
+        Err(e) => Err(e.context("no reachable Emby/Jellyfin endpoint")),
+    }
 }
 
 /// `web/manifest.json` first (no auth needed, served by every Emby/Jellyfin web
@@ -369,13 +375,19 @@ pub async fn probe_caps(
 ) -> Caps {
     let mut caps = Caps::with_flavor_defaults(flavor);
 
-    caps.server_domains = probe_endpoint(client, base, headers, "System/Ext/ServerDomains").await;
-
     let live_tv = match user_id {
         Some(uid) => format!("LiveTv/Channels?UserId={uid}&Limit=1"),
         None => "LiveTv/Channels?Limit=1".to_string(),
     };
-    caps.live_tv = probe_endpoint(client, base, headers, &live_tv).await;
+
+    // Both probes have the same worst case, so run them together instead of
+    // paying the timeout twice.
+    let (server_domains, live_tv) = tokio::join!(
+        probe_endpoint(client, base, headers, "System/Ext/ServerDomains"),
+        probe_endpoint(client, base, headers, &live_tv),
+    );
+    caps.server_domains = server_domains;
+    caps.live_tv = live_tv;
 
     caps.probed = true;
     caps

@@ -187,9 +187,9 @@
                 <property name="subtitle" translatable="yes">Excessive thread counts may exhaust the system's connection pool</property>
                 <property name="adjustment">
                   <object class="GtkAdjustment">
-                    <property name="lower">1</property>
-                    <property name="upper">16</property>
-                    <property name="value">2</property>
+                    <property name="lower">2</property>
+                    <property name="upper">32</property>
+                    <property name="value">8</property>
                     <property name="page-increment">1</property>
                     <property name="step-increment">1</property>
                   </object>
@@ -392,6 +392,7 @@
             <child>
               <object class="AdwSwitchRow" id="config_switchrow">
                 <property name="title" translatable="yes">Enable external config</property>
+                <property name="subtitle" translatable="yes">Reads mpv.conf (decoding, frame timing, shaders, scripts). Options that have a setting in this app still take precedence.</property>
               </object>
             </child>
             <child>

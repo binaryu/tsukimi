@@ -45,7 +45,7 @@ use crate::{
         CacheEvent,
         CachePolicy,
         fetch_with_cache,
-        resolve_picture_file,
+        resolve_picture_file_scaled,
         spawn,
         spawn_tokio,
     },
@@ -807,7 +807,8 @@ impl ItemPage {
         let imp = self.imp();
 
         let backdrop = imp.carousel.imp().backdrop.get();
-        if let Ok(file) = resolve_picture_file(source).await {
+        let scale = self.scale_factor().max(1) as u32;
+        if let Ok(file) = resolve_picture_file_scaled(source, scale).await {
             backdrop.set_file(Some(&file));
             self.imp()
                 .carousel
@@ -836,7 +837,8 @@ impl ItemPage {
                 image_type: BACKDROP,
                 image_index: Some(tag_num as u8),
             };
-            if let Ok(file) = resolve_picture_file(source).await {
+            let scale = self.scale_factor().max(1) as u32;
+            if let Ok(file) = resolve_picture_file_scaled(source, scale).await {
                 let picture = gtk::Picture::builder()
                     .halign(gtk::Align::Fill)
                     .valign(gtk::Align::Fill)

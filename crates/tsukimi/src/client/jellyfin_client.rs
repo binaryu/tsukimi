@@ -69,7 +69,10 @@ use super::{
         fields,
     },
     error::UserFacingError,
-    picture_source::PictureSource,
+    picture_source::{
+        ImageTarget,
+        PictureSource,
+    },
     structs::{
         ActivityLogs,
         Back,
@@ -155,19 +158,41 @@ impl Session {
 
 pub struct JellyfinClient {
     pub session: ArcSwap<Session>,
+    /// Budget for API (JSON) requests.
     pub semaphore: tokio::sync::Semaphore,
+    /// Separate budget for pictures: posters must never queue behind API calls,
+    /// they are what the user is actually waiting for.
+    image_semaphore: tokio::sync::Semaphore,
     pub client: Client,
     next_up_date_cache: Cache<NextUpDateKey, Option<DateTime<Utc>>>,
     /// Throttles `Sessions/Playing*` reports (see [`ReportGate`]).
     report_gate: tokio::sync::Mutex<ReportGate>,
     /// Per-host concurrency limit: one slow server must not starve the others.
     hosts: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Limit for newly created per-host semaphores.
+    ///
+    /// Captured in `Default` because `SETTINGS` wraps a `ThreadGuard` and may only
+    /// be read on the main thread (see `app.rs`); reading it inside a request
+    /// panics on every tokio worker.
+    host_limit: usize,
     /// Last time a failover was attempted, to avoid probing storms.
     failover_at: tokio::sync::Mutex<Option<Instant>>,
+    /// In-flight/settled picture downloads keyed by cache key. moka coalesces
+    /// concurrent requests for the same key, so the same poster is downloaded
+    /// once even when it appears in several rows at once.
+    image_cache: Cache<String, PathBuf>,
 }
 
 /// How often a network failure may trigger a line switch.
 const FAILOVER_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// Concurrent picture downloads. Independent of the API budget: a grid of
+/// posters used to be one request at a time because `threads` defaults to 1.
+const IMAGE_CONCURRENCY: usize = 6;
+
+/// Never go below this many concurrent requests per host, whatever "threads" is
+/// set to: 1 serialises every single request in the application.
+const MIN_HOST_CONCURRENCY: i32 = 4;
 
 /// One line as the settings dialog needs it.
 #[derive(Clone, Debug)]
@@ -363,7 +388,8 @@ impl Default for JellyfinClient {
     fn default() -> Self {
         Self {
             session: ArcSwap::from_pointee(Session::empty()),
-            semaphore: tokio::sync::Semaphore::new(SETTINGS.threads() as usize),
+            semaphore: tokio::sync::Semaphore::new(SETTINGS.threads().clamp(2, 32) as usize),
+            image_semaphore: tokio::sync::Semaphore::new(IMAGE_CONCURRENCY),
             client: ReqClient::build(),
             next_up_date_cache: Cache::builder()
                 .max_capacity(256)
@@ -372,7 +398,12 @@ impl Default for JellyfinClient {
                 .build(),
             report_gate: tokio::sync::Mutex::new(ReportGate::default()),
             hosts: std::sync::Mutex::new(HashMap::new()),
+            host_limit: (SETTINGS.threads().max(MIN_HOST_CONCURRENCY) as usize).max(2),
             failover_at: tokio::sync::Mutex::new(None),
+            image_cache: Cache::builder()
+                .max_capacity(4096)
+                .time_to_live(Duration::from_hours(1))
+                .build(),
         }
     }
 }
@@ -601,10 +632,11 @@ impl JellyfinClient {
         let profile = session.profile.clone();
         let servername = session.account.servername.clone();
         self.session.store(Arc::new(session));
-        let _ = SETTINGS.update_account_profile(&servername, Some(profile));
+        persist_profile(servername, profile);
     }
 
     pub async fn init(&self, account: &Account) -> Result<(), Box<dyn std::error::Error>> {
+        let started = Instant::now();
         let hint = account.server_type.unwrap_or_default();
         let raw_url = account.url()?.to_string();
         let mut profile = account.profile.clone().unwrap_or_default();
@@ -613,7 +645,10 @@ impl JellyfinClient {
         //    candidate and, if nothing answers, fall back to the historical rule
         //    so a setup that worked before keeps working.
         let url = match profile.base_url() {
-            Some(base) => base,
+            Some(base) => {
+                tracing::debug!("using cached base {base}");
+                base
+            }
             None => match compat::resolve_base(&self.client, &raw_url, hint).await {
                 Ok(resolved) => {
                     if !profile.caps.probed {
@@ -642,54 +677,43 @@ impl JellyfinClient {
             profile.auth,
         )?;
 
-        // 3) Capabilities are probed once and cached on the account.
-        let mut profile_changed = false;
-        if !profile.caps.probed {
-            profile.caps = compat::probe_caps(
-                &self.client,
-                &url,
-                &headers,
-                Some(&account.user_id),
-                profile.flavor,
-            )
-            .await;
-            profile_changed = true;
-        }
-
-        // 4) Discover alternate lines once. They are cached too, so a switch in
-        //    the settings dialog survives restarts.
+        // 3) Alternate lines are cheap to seed from what we already know; the
+        //    server-reported ones arrive in the background below.
         if profile.lines.is_empty() {
-            let mut lines = Vec::new();
-            push_line(&mut lines, &url);
+            push_line(&mut profile.lines, &url);
             if let Ok(configured) = account.url() {
-                push_line(&mut lines, &configured);
-            }
-            if profile.caps.server_domains {
-                for line in self.fetch_server_domains(&url, &headers).await {
-                    push_line(&mut lines, &Url::parse(&line.url).unwrap_or(url.clone()));
-                }
-            }
-            if !lines.is_empty() {
-                profile.lines = lines;
-                profile_changed = true;
+                push_line(&mut profile.lines, &configured);
             }
         }
 
-        if profile_changed {
-            let _ = SETTINGS.update_account_profile(&account.servername, Some(profile.clone()));
-        }
+        // Persist the resolved root right away: the background discovery below
+        // may never finish (app closed, server slow), and a lost base URL means
+        // probing again on the next start.
+        persist_profile(account.servername.clone(), profile.clone());
 
+        // Publish the session *now*: entering a server must not wait for
+        // capability probing, which can take a network timeout on servers that do
+        // not implement the optional endpoints.
         self.session.store(Arc::new(Session {
             account: account.clone(),
             profile,
-            url_headers: Some((url, headers)),
+            url_headers: Some((url.clone(), headers.clone())),
             server_name_hash: generate_hash(&account.servername),
         }));
         self.next_up_date_cache.invalidate_all();
+        tracing::debug!(
+            "session for {} ready in {:?}",
+            account.servername,
+            started.elapsed()
+        );
 
         crate::ui::provider::set_admin(false);
         let servername = account.servername.clone();
         spawn_tokio_without_await(async move {
+            JELLYFIN_CLIENT
+                .discover_in_background(&servername, url, headers)
+                .await;
+
             match JELLYFIN_CLIENT.get_current_user().await {
                 Ok(r) => {
                     if r.policy.is_administrator {
@@ -703,9 +727,8 @@ impl JellyfinClient {
                         // confusing state: everything 401s while the account
                         // still looks configured.
                         warn!(
-                            "stored credential for {} was rejected (401) - the account needs to \
-                             be re-logged in; keeping the configuration",
-                            servername
+                            "stored credential for {servername} was rejected (401) - the account \
+                             needs to be re-logged in; keeping the configuration"
                         );
                     } else {
                         warn!("Failed to authenticate as admin: {message}");
@@ -713,7 +736,47 @@ impl JellyfinClient {
                 }
             }
         });
+
         Ok(())
+    }
+
+    /// Probe optional capabilities and server reported addresses after the
+    /// session is already usable. Never blocks entering a server.
+    async fn discover_in_background(&self, servername: &str, base: Url, headers: HeaderMap) {
+        let session = Session::clone(&self.session());
+        if session.account.servername != servername {
+            return;
+        }
+
+        let mut profile = session.profile.clone();
+        let user_id = session.account.user_id.clone();
+
+        if !profile.caps.probed {
+            profile.caps = compat::probe_caps(
+                &self.client,
+                &base,
+                &headers,
+                Some(&user_id),
+                profile.flavor,
+            )
+            .await;
+        }
+
+        for line in self.fetch_server_domains(&base, &headers).await {
+            if let Ok(url) = Url::parse(&line.url) {
+                push_line(&mut profile.lines, &url);
+            }
+        }
+
+        // The user may have switched accounts while we were probing.
+        if self.session().account.servername != servername {
+            return;
+        }
+
+        let mut updated = Session::clone(&self.session());
+        updated.profile = profile.clone();
+        self.session.store(Arc::new(updated));
+        persist_profile(servername.to_string(), profile);
     }
 
     pub async fn request<T>(&self, path: &str, params: &[(&str, &str)]) -> Result<T>
@@ -844,12 +907,12 @@ impl JellyfinClient {
         let profile = session.profile.clone();
         let servername = session.account.servername.clone();
         self.session.store(Arc::new(session));
-        let _ = SETTINGS.update_account_profile(&servername, Some(profile));
+        persist_profile(servername, profile);
     }
 
     pub async fn request_picture(&self, path: &str, params: &[(&str, &str)]) -> Result<Response> {
         let request = self.prepare_request(Method::GET, path, params)?;
-        let res = self.send_request(request).await?;
+        let res = self.send_image_request(request).await?;
         Ok(res)
     }
 
@@ -920,6 +983,15 @@ impl JellyfinClient {
     }
 
     async fn send_request(&self, request: RequestBuilder) -> Result<Response> {
+        self.send_with_budget(request, false).await
+    }
+
+    /// Pictures use their own budget so a slow API call cannot block a poster.
+    async fn send_image_request(&self, request: RequestBuilder) -> Result<Response> {
+        self.send_with_budget(request, true).await
+    }
+
+    async fn send_with_budget(&self, request: RequestBuilder, image: bool) -> Result<Response> {
         // Limit concurrency per host on top of the global budget: home pages fan
         // out to many endpoints at once and a single low powered NAS would
         // otherwise get the whole burst.
@@ -932,7 +1004,11 @@ impl JellyfinClient {
             None => None,
         };
 
-        let _global = self.semaphore.acquire().await?;
+        let _budget = if image {
+            self.image_semaphore.acquire().await?
+        } else {
+            self.semaphore.acquire().await?
+        };
         let res = request.send().await;
         drop(host_permit);
 
@@ -940,11 +1016,10 @@ impl JellyfinClient {
     }
 
     fn host_semaphore(&self, host: &str) -> Arc<tokio::sync::Semaphore> {
-        let limit = (SETTINGS.threads().max(1) as usize).max(2);
         let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
         hosts
             .entry(host.to_string())
-            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(self.host_limit)))
             .clone()
     }
 
@@ -1324,14 +1399,15 @@ impl JellyfinClient {
     }
 
     pub async fn get_image(&self, source: PictureSource) -> Result<PathBuf> {
-        let mut path = jellyfin_cache_path().await;
-        path.push(source.cache_key());
+        self.get_image_scaled(source, 1).await
+    }
 
-        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
-            return Ok(path);
-        }
-
-        let (request_path, max_height, max_width, tag) = match source {
+    /// Download (or reuse) one image, sized for the given physical pixel ratio.
+    ///
+    /// The resolved size is part of the cache key, so HiDPI and standard cards do
+    /// not fight over the same file and a size change re-downloads once.
+    pub async fn get_image_scaled(&self, source: PictureSource, scale: u32) -> Result<PathBuf> {
+        let (request_path, target, tag) = match &source {
             PictureSource::Item {
                 id,
                 tag,
@@ -1342,25 +1418,52 @@ impl JellyfinClient {
                 if let Some(image_index) = image_index {
                     request_path.push_str(&format!("/{image_index}"));
                 }
-                let (max_height, max_width) = if image_type == BACKDROP {
-                    ("800", "1280")
+                let target = if *image_type == BACKDROP {
+                    ImageTarget::BACKDROP
                 } else {
-                    ("300", "300")
+                    ImageTarget::CARD
                 };
-                (request_path, max_height, max_width, tag)
+                (request_path, target, tag.clone())
             }
-            PictureSource::User { id, tag } => {
-                (format!("Users/{id}/Images/Primary"), "50", "50", tag)
-            }
+            PictureSource::User { id, tag } => (
+                format!("Users/{id}/Images/Primary"),
+                ImageTarget::AVATAR,
+                tag.clone(),
+            ),
             PictureSource::Url { .. } => unreachable!(),
         };
 
+        let target = target.scaled(scale);
+        let cache_key = format!("{}-{}", source.cache_key(), target.cache_suffix());
+
+        let mut path = jellyfin_cache_path().await;
+        path.push(&cache_key);
+        if tokio::fs::metadata(&path).await.is_ok_and(|m| m.is_file()) {
+            return Ok(path);
+        }
+
+        // moka's `try_get_with` is single flight: concurrent callers for the same
+        // key await one download instead of hammering the server.
+        self.image_cache
+            .try_get_with(cache_key, async move {
+                self.download_image(&request_path, target, &tag, path).await
+            })
+            .await
+            .map_err(|e| anyhow!("{e}"))
+    }
+
+    async fn download_image(
+        &self, request_path: &str, target: ImageTarget, tag: &str, path: PathBuf,
+    ) -> Result<PathBuf> {
+        let width = target.width.to_string();
+        let height = target.height.to_string();
         let params = [
-            ("maxHeight", max_height),
-            ("maxWidth", max_width),
-            ("tag", tag.as_str()),
+            ("maxHeight", height.as_str()),
+            ("maxWidth", width.as_str()),
+            ("tag", tag),
         ];
-        let response = self.request_picture(&request_path, &params).await?;
+
+        let response = self.request_picture(request_path, &params).await?;
         if response.status() == reqwest::StatusCode::NOT_FOUND {
             bail!("Image not found");
         }
@@ -2240,6 +2343,16 @@ impl JellyfinClient {
 /// emos/Meridian) hand out paths that already contain the base path: with a
 /// base of `https://host/emby/`, `"/emby/emya/subtitle?..."` must not become
 /// `/emby/emby/emya/subtitle?...`, which answers 404.
+/// Persist the compatibility profile from the main thread.
+///
+/// `SETTINGS` wraps a `ThreadGuard` and panics when touched from a tokio worker,
+/// and every caller here runs inside one.
+fn persist_profile(servername: String, profile: ServerProfile) {
+    crate::utils::spawn(async move {
+        let _ = SETTINGS.update_account_profile(&servername, Some(profile));
+    });
+}
+
 /// Append one line if it is not already listed.
 fn push_line(lines: &mut Vec<compat::Line>, url: &Url) {
     let text = url.to_string();
