@@ -1,4 +1,5 @@
 pub mod account;
+pub mod compat;
 pub mod error;
 pub mod jellyfin_client;
 pub mod picture_source;

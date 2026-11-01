@@ -11,7 +11,10 @@ use gtk::{
 
 use crate::{
     APP_ID,
-    client::Account,
+    client::{
+        Account,
+        compat::ServerProfile,
+    },
     ui::provider::descriptor::{
         Descriptor,
         VecSerialize,
@@ -332,6 +335,26 @@ impl Settings {
         }
         accounts.push(account);
         self.set_string(Self::ACCOUNTS, &accounts.to_string())
+    }
+
+    /// Persist the compatibility profile discovered for one account (resolved
+    /// base URL, flavour, auth style, capabilities) so the next start can skip
+    /// probing. Matching is by server name, which `add_account` keeps unique.
+    pub fn update_account_profile(
+        &self, servername: &str, profile: Option<ServerProfile>,
+    ) -> Result<(), glib::BoolError> {
+        let mut accounts = self.accounts();
+        let mut changed = false;
+        for account in accounts.iter_mut() {
+            if account.servername == servername && account.profile != profile {
+                account.profile = profile.clone();
+                changed = true;
+            }
+        }
+        if changed {
+            self.set_string(Self::ACCOUNTS, &accounts.to_string())?;
+        }
+        Ok(())
     }
 
     pub fn remove_account(&self, account: Account) -> Result<(), glib::BoolError> {

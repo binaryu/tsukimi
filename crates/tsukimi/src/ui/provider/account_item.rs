@@ -81,6 +81,7 @@ impl AccountItem {
             user_id: self.user_id(),
             access_token: self.access_token(),
             server_type: Some(ServerType::from_index(self.server_type())),
+            profile: None,
         }
     }
 }

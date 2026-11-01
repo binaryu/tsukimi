@@ -151,8 +151,11 @@ impl AccountWindow {
         let server = format!("{protocol}{server}");
         let server_type = ServerType::from_index(imp.server_type.selected());
         let account = match spawn_tokio(async move {
-            let login = JELLYFIN_CLIENT
-                .login(&server, &port, server_type, &username, &password)
+            // Resolve the profile while the credentials are at hand: it saves a
+            // probe on every later start and remembers which base URL/authorization
+            // dialect this particular server wants.
+            let (login, profile) = JELLYFIN_CLIENT
+                .login_resolved(&server, &port, server_type, &username, &password)
                 .await?;
             let servername = if servername.is_empty() {
                 JELLYFIN_CLIENT
@@ -172,6 +175,7 @@ impl AccountWindow {
                 user_id: login.user.id,
                 access_token: login.access_token,
                 server_type: Some(server_type),
+                profile: Some(profile),
             })
         })
         .await

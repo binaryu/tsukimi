@@ -242,6 +242,8 @@ mod imp {
             self.obj()
                 .save_window_state()
                 .expect("Failed to save window state");
+            // Flush the final playback progress before the process goes away.
+            self.obj().imp().mpvnav.drain_progress();
             // Allow to invoke other event handlers
             glib::Propagation::Proceed
         }

@@ -38,6 +38,7 @@ pub mod refresh_dialog;
 pub mod scale_revealer;
 pub mod search;
 pub mod server_action_row;
+pub mod server_lines;
 pub mod server_panel;
 pub mod single_grid;
 pub mod smooth_scale;

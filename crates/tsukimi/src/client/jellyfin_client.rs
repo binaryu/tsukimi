@@ -4,7 +4,10 @@ use std::{
     future,
     hash::Hasher,
     path::PathBuf,
-    time::Duration,
+    time::{
+        Duration,
+        Instant,
+    },
 };
 
 use crate::{
@@ -58,6 +61,13 @@ use uuid::Uuid;
 use super::{
     Account,
     ReqClient,
+    compat::{
+        self,
+        AuthStyle,
+        Flavor,
+        ServerProfile,
+        fields,
+    },
     error::UserFacingError,
     picture_source::PictureSource,
     structs::{
@@ -128,6 +138,8 @@ pub struct Session {
     pub account: Account,
     pub url_headers: Option<(Url, HeaderMap)>,
     pub server_name_hash: String,
+    /// Resolved compatibility profile for the active account.
+    pub profile: ServerProfile,
 }
 
 impl Session {
@@ -136,6 +148,7 @@ impl Session {
             account: Account::default(),
             url_headers: None,
             server_name_hash: String::new(),
+            profile: ServerProfile::default(),
         }
     }
 }
@@ -145,6 +158,100 @@ pub struct JellyfinClient {
     pub semaphore: tokio::sync::Semaphore,
     pub client: Client,
     next_up_date_cache: Cache<NextUpDateKey, Option<DateTime<Utc>>>,
+    /// Throttles `Sessions/Playing*` reports (see [`ReportGate`]).
+    report_gate: tokio::sync::Mutex<ReportGate>,
+    /// Per-host concurrency limit: one slow server must not starve the others.
+    hosts: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Semaphore>>>,
+    /// Last time a failover was attempted, to avoid probing storms.
+    failover_at: tokio::sync::Mutex<Option<Instant>>,
+}
+
+/// How often a network failure may trigger a line switch.
+const FAILOVER_COOLDOWN: Duration = Duration::from_secs(15);
+
+/// One line as the settings dialog needs it.
+#[derive(Clone, Debug)]
+pub struct LineStatus {
+    pub url: String,
+    pub label: String,
+    pub current: bool,
+    pub preferred: bool,
+    pub latency_ms: Option<u64>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum ReportKind {
+    Start,
+    Progress,
+    Stop,
+}
+
+/// Playback progress reports are throttled and serialised here.
+///
+/// The UI fires a report on every 10 s tick, on every seek, on segment skips and
+/// on stop, so the same position used to be sent several times in a row; a slow
+/// or self-built server then saw bursts of duplicate sessions. Two rules keep it
+/// honest without ever losing the important events:
+///
+/// * `Start`/`Stop` always go through (a repeated `Stop` for the same session is
+///   dropped so leaving the page and closing the window does not report twice).
+/// * `Progress` only goes when the position actually moved by at least
+///   [`PROGRESS_MIN_DELTA_TICKS`], or [`PROGRESS_KEEPALIVE`] has passed since the
+///   last one (keeps paused sessions alive without spamming).
+///
+/// Failures back off to the keepalive interval instead of retrying every tick.
+#[derive(Default)]
+struct ReportGate {
+    key: String,
+    kind: Option<ReportKind>,
+    ticks: u64,
+    sent: Option<Instant>,
+    failures: u32,
+}
+
+/// 2 seconds in 100 ns ticks: below this a `Progress` report is a duplicate.
+const PROGRESS_MIN_DELTA_TICKS: u64 = 20_000_000;
+
+/// Even a frozen position is reported this often so the server keeps the session.
+const PROGRESS_KEEPALIVE: Duration = Duration::from_secs(60);
+
+impl ReportGate {
+    fn should_send(&self, kind: ReportKind, key: &str, ticks: u64) -> bool {
+        match kind {
+            ReportKind::Start => true,
+            // The same session may be stopped twice (leaving the page, then
+            // closing the window); only the first one has to reach the server.
+            ReportKind::Stop => !(self.kind == Some(ReportKind::Stop) && self.key == key),
+            ReportKind::Progress => {
+                if self.key != key {
+                    return true;
+                }
+                let elapsed = self
+                    .sent
+                    .map(|sent| sent.elapsed())
+                    .unwrap_or(PROGRESS_KEEPALIVE);
+                if self.failures > 0 {
+                    // Do not hammer a server that is rejecting the reports.
+                    return elapsed >= PROGRESS_KEEPALIVE;
+                }
+                ticks.abs_diff(self.ticks) >= PROGRESS_MIN_DELTA_TICKS
+                    || elapsed >= PROGRESS_KEEPALIVE
+            }
+        }
+    }
+
+    fn record(&mut self, kind: ReportKind, key: &str, ticks: u64, ok: bool) {
+        self.key = key.to_string();
+        self.kind = Some(kind);
+        self.ticks = ticks;
+        self.sent = Some(Instant::now());
+        match kind {
+            ReportKind::Progress if !ok => {
+                self.failures = self.failures.saturating_add(1);
+            }
+            _ => self.failures = 0,
+        }
+    }
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -153,43 +260,92 @@ struct NextUpDateKey {
     item_id: String,
 }
 
+/// Build the authorization headers for one dialect.
+///
+/// Two spellings exist in the wild: Jellyfin (and newer Emby) expect
+/// `Authorization: MediaBrowser Client=…,Token=…`, older Emby builds only accept
+/// `X-Emby-authorization: Emby …` plus `X-Emby-Token`. Which one a given server
+/// wants is negotiated at runtime, not guessed from its type.
 fn build_headers(
-    user_id: Option<&str>, token: Option<&str>, server_type: ServerType,
+    user_id: Option<&str>, token: Option<&str>, style: AuthStyle,
+) -> Result<HeaderMap> {
+    build_headers_with(user_id, token, style, &DEVICE_ID)
+}
+
+/// Build authorization headers for one dialect.
+///
+/// Two spellings exist in the wild and they are not interchangeable:
+///
+/// * Emby (and most forks) read `X-Emby-Token`, optionally with a
+///   `X-Emby-authorization` scheme line.
+/// * Jellyfin reads `Authorization: MediaBrowser …`, `X-Emby-Token`, or the
+///   legacy `X-Emby-Authorization` header.
+///
+/// The important part: a login request is unauthenticated, so a dialect that
+/// succeeds at login says nothing about the dialect needed afterwards. Sending
+/// `X-Emby-Token` **in every dialect** (and both scheme headers for `Auto`) is
+/// harmless for the servers that ignore the extra header and is the only thing
+/// that keeps self-built servers working.
+fn build_headers_with(
+    user_id: Option<&str>, token: Option<&str>, style: AuthStyle, device_id: &str,
 ) -> Result<HeaderMap> {
     let mut authorization = format!(
         "Client={},Device={},DeviceId={},Version={}",
         CLIENT_ID,
         *DEVICE_NAME,
-        *DEVICE_ID,
+        device_id,
         version()
     );
     if let Some(user_id) = user_id {
         authorization.push_str(&format!(",UserId={}", user_id));
     }
+
     let mut headers = HeaderMap::new();
-    match server_type {
-        ServerType::Emby => {
+    match style {
+        AuthStyle::Emby => {
             headers.insert(
                 "X-Emby-authorization",
                 HeaderValue::from_str(&format!("Emby {authorization}"))?,
             );
-            if let Some(token) = token {
-                headers.insert("X-Emby-Token", HeaderValue::from_str(token)?);
-            }
         }
-        ServerType::Jellyfin => {
+        AuthStyle::MediaBrowser => {
+            let mut browser = authorization.clone();
             if let Some(token) = token {
-                authorization.push_str(&format!(",Token={token}"));
+                browser.push_str(&format!(",Token={token}"));
             }
             headers.insert(
                 "Authorization",
-                HeaderValue::from_str(&format!("MediaBrowser {authorization}"))?,
+                HeaderValue::from_str(&format!("MediaBrowser {browser}"))?,
             );
         }
+        AuthStyle::Auto => {
+            let mut browser = authorization.clone();
+            if let Some(token) = token {
+                browser.push_str(&format!(",Token={token}"));
+            }
+            headers.insert(
+                "Authorization",
+                HeaderValue::from_str(&format!("MediaBrowser {browser}"))?,
+            );
+            headers.insert(
+                "X-Emby-authorization",
+                HeaderValue::from_str(&format!("Emby {authorization}"))?,
+            );
+        }
+    }
+
+    // Every dialect gets the token header: Emby requires it, Jellyfin accepts it.
+    if let Some(token) = token {
+        headers.insert("X-Emby-Token", HeaderValue::from_str(token)?);
     }
     Ok(headers)
 }
 
+/// Legacy base URL rule, kept as the fallback when probing fails.
+///
+/// New code should go through [`compat::resolve_base`], which tries the address
+/// as typed, `<address>/emby` and the stripped variant instead of assuming that
+/// Emby always lives under `/emby/`.
 fn build_base_url(url: Url, server_type: ServerType) -> Result<Url> {
     match server_type {
         ServerType::Emby => Ok(url.join("emby/")?),
@@ -214,6 +370,9 @@ impl Default for JellyfinClient {
                 .time_to_live(Duration::from_hours(2))
                 .support_invalidation_closures()
                 .build(),
+            report_gate: tokio::sync::Mutex::new(ReportGate::default()),
+            hosts: std::sync::Mutex::new(HashMap::new()),
+            failover_at: tokio::sync::Mutex::new(None),
         }
     }
 }
@@ -224,29 +383,312 @@ impl JellyfinClient {
     }
 
     fn server_type(&self) -> ServerType {
-        self.session.load().account.server_type.unwrap_or_default()
+        let session = self.session.load();
+        // Nothing probed yet (offline start, probe failed): trust the picker.
+        if !session.profile.caps.probed {
+            return session.account.server_type.unwrap_or_default();
+        }
+        // Otherwise the detected flavour wins; the picker was only a hint.
+        match session.profile.flavor {
+            Flavor::Jellyfin => ServerType::Jellyfin,
+            Flavor::Emby | Flavor::FnOs | Flavor::Ugreen => ServerType::Emby,
+            Flavor::Custom => session.account.server_type.unwrap_or_default(),
+        }
+    }
+
+    pub fn flavor(&self) -> Flavor {
+        self.session.load().profile.flavor
+    }
+
+    pub fn caps(&self) -> compat::Caps {
+        let session = self.session.load();
+        let caps = session.profile.caps;
+        if caps.probed {
+            caps
+        } else {
+            // Fall back to flavour defaults so a failed probe cannot switch a
+            // feature off that used to work.
+            compat::Caps::with_flavor_defaults(session.profile.flavor)
+        }
     }
 
     pub fn is_jellyfin(&self) -> bool {
         matches!(self.server_type(), ServerType::Jellyfin)
     }
 
+    /// API root currently in use.
+    pub fn current_base(&self) -> Option<String> {
+        self.session()
+            .url_headers
+            .as_ref()
+            .map(|(url, _)| url.to_string())
+    }
+
+    /// Configured lines with the current/perferred markers, without latencies.
+    pub fn line_statuses(&self) -> Vec<LineStatus> {
+        let session = self.session();
+        let current = session.url_headers.as_ref().map(|(url, _)| url.to_string());
+        session
+            .profile
+            .lines
+            .iter()
+            .map(|line| LineStatus {
+                url: line.url.clone(),
+                label: line.label.clone(),
+                current: Some(&line.url) == current.as_ref(),
+                preferred: session.profile.preferred.as_deref() == Some(line.url.as_str()),
+                latency_ms: None,
+            })
+            .collect()
+    }
+
+    /// Measure every configured line in parallel (`System/Info/Public` round trip).
+    pub async fn measure_lines(&self) -> Vec<LineStatus> {
+        let mut statuses = self.line_statuses();
+        let urls: Vec<String> = statuses.iter().map(|line| line.url.clone()).collect();
+
+        let latencies = futures_util::future::join_all(
+            urls.iter()
+                .map(|url| compat::measure(&self.client, url))
+                .collect::<Vec<_>>(),
+        )
+        .await;
+
+        for (status, latency) in statuses.iter_mut().zip(latencies) {
+            status.latency_ms = latency;
+        }
+        statuses
+    }
+
+    /// Re-read `System/Ext/ServerDomains` and merge it with the known addresses.
+    pub async fn refresh_lines(&self) -> Vec<LineStatus> {
+        let session = Session::clone(&self.session());
+        let Some((base, headers)) = session.url_headers.clone() else {
+            return Vec::new();
+        };
+
+        let mut lines = Vec::new();
+        if let Ok(configured) = session.account.url() {
+            push_line(&mut lines, &configured);
+        }
+        push_line(&mut lines, &base);
+        for line in self.fetch_server_domains(&base, &headers).await {
+            if let Ok(url) = Url::parse(&line.url) {
+                push_line(&mut lines, &url);
+            }
+        }
+
+        self.store_lines(lines);
+        self.line_statuses()
+    }
+
+    /// Switch to a line the user picked. Verifies it first, so a broken line can
+    /// never replace a working one.
+    pub async fn switch_line(&self, url: &str) -> Result<()> {
+        let Ok(base) = Url::parse(url) else {
+            bail!("invalid server line: {url}");
+        };
+        if compat::measure(&self.client, url).await.is_none() {
+            bail!("server line did not answer: {url}");
+        }
+        self.switch_base(base, true).await
+    }
+
+    /// Drop the manual pin and move to whichever line answers fastest.
+    pub async fn use_automatic_line(&self) -> Result<()> {
+        let statuses = self.measure_lines().await;
+        let best = statuses
+            .iter()
+            .filter(|line| line.latency_ms.is_some())
+            .min_by_key(|line| line.latency_ms)
+            .cloned();
+
+        match best {
+            Some(best) if !best.current => {
+                let base = Url::parse(&best.url)?;
+                self.switch_base(base, false).await?;
+            }
+            _ => {
+                // Nothing better (or already on the best one): just clear the pin.
+                let mut session = Session::clone(&self.session());
+                session.profile.preferred = None;
+                self.store_session(session);
+            }
+        }
+        Ok(())
+    }
+
+    async fn switch_base(&self, base: Url, pin: bool) -> Result<()> {
+        let mut session = Session::clone(&self.session());
+        let headers = build_headers(
+            Some(&session.account.user_id),
+            Some(&session.account.access_token),
+            session.profile.auth,
+        )?;
+        session.profile.base = base.to_string();
+        session.profile.preferred = pin.then(|| base.to_string());
+        session.url_headers = Some((base, headers));
+        let base = session.profile.base.clone();
+        self.store_session(session);
+        tracing::info!("switched server line to {base}");
+        Ok(())
+    }
+
+    /// Move to another configured line after a network failure. Returns whether
+    /// the session changed and the request is worth retrying.
+    async fn try_failover(&self) -> bool {
+        {
+            let mut last = self.failover_at.lock().await;
+            match *last {
+                Some(at) if at.elapsed() < FAILOVER_COOLDOWN => return false,
+                _ => *last = Some(Instant::now()),
+            }
+        }
+
+        let session = Session::clone(&self.session());
+        let current = session.url_headers.as_ref().map(|(url, _)| url.to_string());
+        let candidates: Vec<String> = session
+            .profile
+            .lines
+            .iter()
+            .map(|line| line.url.clone())
+            .filter(|url| Some(url) != current.as_ref())
+            .collect();
+
+        for url in candidates {
+            if compat::measure(&self.client, &url).await.is_none() {
+                continue;
+            }
+            if let Ok(base) = Url::parse(&url)
+                && self.switch_base(base, false).await.is_ok()
+            {
+                return true;
+            }
+        }
+        false
+    }
+
+    async fn fetch_server_domains(&self, base: &Url, headers: &HeaderMap) -> Vec<compat::Line> {
+        let Ok(url) = base.join("System/Ext/ServerDomains") else {
+            return Vec::new();
+        };
+        let Ok(res) = self
+            .client
+            .get(url)
+            .headers(headers.clone())
+            .timeout(compat::PROBE_TIMEOUT)
+            .send()
+            .await
+        else {
+            return Vec::new();
+        };
+        if !res.status().is_success() {
+            return Vec::new();
+        }
+        let Ok(value) = res.json::<serde_json::Value>().await else {
+            return Vec::new();
+        };
+        compat::parse_server_domains(base, &value)
+    }
+
+    fn store_lines(&self, lines: Vec<compat::Line>) {
+        let mut session = Session::clone(&self.session());
+        session.profile.lines = lines;
+        self.store_session(session);
+    }
+
+    fn store_session(&self, session: Session) {
+        let profile = session.profile.clone();
+        let servername = session.account.servername.clone();
+        self.session.store(Arc::new(session));
+        let _ = SETTINGS.update_account_profile(&servername, Some(profile));
+    }
+
     pub async fn init(&self, account: &Account) -> Result<(), Box<dyn std::error::Error>> {
-        let server_type = account.server_type.unwrap_or_default();
+        let hint = account.server_type.unwrap_or_default();
+        let raw_url = account.url()?.to_string();
+        let mut profile = account.profile.clone().unwrap_or_default();
+
+        // 1) Resolve the API root. Reuse the cached value; otherwise probe every
+        //    candidate and, if nothing answers, fall back to the historical rule
+        //    so a setup that worked before keeps working.
+        let url = match profile.base_url() {
+            Some(base) => base,
+            None => match compat::resolve_base(&self.client, &raw_url, hint).await {
+                Ok(resolved) => {
+                    if !profile.caps.probed {
+                        profile.flavor = compat::detect_flavor(&resolved.info);
+                    }
+                    profile.base = resolved.base.to_string();
+                    resolved.base
+                }
+                Err(e) => {
+                    warn!("probe for {raw_url} failed ({e}); using legacy base url");
+                    if !profile.caps.probed {
+                        profile.flavor = match hint {
+                            ServerType::Jellyfin => Flavor::Jellyfin,
+                            ServerType::Emby => Flavor::Emby,
+                        };
+                    }
+                    build_base_url(account.url()?, hint)?
+                }
+            },
+        };
+
+        // 2) Authorization dialect (negotiated further on 401, see `request`).
         let headers = build_headers(
             Some(&account.user_id),
             Some(&account.access_token),
-            server_type,
+            profile.auth,
         )?;
-        let url = build_base_url(account.url()?, server_type)?;
+
+        // 3) Capabilities are probed once and cached on the account.
+        let mut profile_changed = false;
+        if !profile.caps.probed {
+            profile.caps = compat::probe_caps(
+                &self.client,
+                &url,
+                &headers,
+                Some(&account.user_id),
+                profile.flavor,
+            )
+            .await;
+            profile_changed = true;
+        }
+
+        // 4) Discover alternate lines once. They are cached too, so a switch in
+        //    the settings dialog survives restarts.
+        if profile.lines.is_empty() {
+            let mut lines = Vec::new();
+            push_line(&mut lines, &url);
+            if let Ok(configured) = account.url() {
+                push_line(&mut lines, &configured);
+            }
+            if profile.caps.server_domains {
+                for line in self.fetch_server_domains(&url, &headers).await {
+                    push_line(&mut lines, &Url::parse(&line.url).unwrap_or(url.clone()));
+                }
+            }
+            if !lines.is_empty() {
+                profile.lines = lines;
+                profile_changed = true;
+            }
+        }
+
+        if profile_changed {
+            let _ = SETTINGS.update_account_profile(&account.servername, Some(profile.clone()));
+        }
+
         self.session.store(Arc::new(Session {
             account: account.clone(),
+            profile,
             url_headers: Some((url, headers)),
             server_name_hash: generate_hash(&account.servername),
         }));
         self.next_up_date_cache.invalidate_all();
 
         crate::ui::provider::set_admin(false);
+        let servername = account.servername.clone();
         spawn_tokio_without_await(async move {
             match JELLYFIN_CLIENT.get_current_user().await {
                 Ok(r) => {
@@ -254,7 +696,21 @@ impl JellyfinClient {
                         crate::ui::provider::set_admin(true);
                     }
                 }
-                Err(e) => warn!("Failed to authenticate as admin: {}", e),
+                Err(e) => {
+                    let message = e.to_string();
+                    if message.contains("401") {
+                        // A stored token that is rejected is the single most
+                        // confusing state: everything 401s while the account
+                        // still looks configured.
+                        warn!(
+                            "stored credential for {} was rejected (401) - the account needs to \
+                             be re-logged in; keeping the configuration",
+                            servername
+                        );
+                    } else {
+                        warn!("Failed to authenticate as admin: {message}");
+                    }
+                }
             }
         });
         Ok(())
@@ -264,8 +720,7 @@ impl JellyfinClient {
     where
         T: for<'de> Deserialize<'de> + Send + 'static,
     {
-        let request = self.prepare_request(Method::GET, path, params)?;
-        let res = self.send_request(request).await?;
+        let res = self.get_with_auth_retry(path, params).await?;
 
         let res = match res.error_for_status() {
             Ok(r) => r,
@@ -287,6 +742,109 @@ impl JellyfinClient {
                 String::from_utf8_lossy(&res_bytes)
             )),
         }
+    }
+
+    /// GET that retries once with the alternate authorization dialect when the
+    /// server answers 401. Servers differ: older Emby forks only accept
+    /// `X-Emby-authorization`, Jellyfin only accepts `Authorization: MediaBrowser`.
+    /// Whichever spelling works is remembered on the session and the account.
+    async fn get_with_auth_retry(&self, path: &str, params: &[(&str, &str)]) -> Result<Response> {
+        let mut res = self.get_once(path, params).await?;
+
+        if res.status() == reqwest::StatusCode::UNAUTHORIZED {
+            let current = self.session().profile.auth;
+            let alternate = current.alternate().unwrap_or(AuthStyle::Emby);
+            tracing::debug!("401 for {path}, retrying with {alternate:?} authorization");
+            let retried = self.retry_with_style(path, params, alternate).await?;
+            if retried.status().is_success() {
+                self.remember_auth_style(alternate);
+            }
+            res = retried;
+
+            // Still rejected (a profile recorded a dialect this server does not
+            // accept): fall back to sending every dialect at once.
+            if res.status() == reqwest::StatusCode::UNAUTHORIZED && current != AuthStyle::Auto {
+                tracing::debug!("401 for {path}, retrying with every authorization dialect");
+                let retried = self.retry_with_style(path, params, AuthStyle::Auto).await?;
+                if retried.status().is_success() {
+                    self.remember_auth_style(AuthStyle::Auto);
+                }
+                res = retried;
+            }
+        }
+
+        if res.status().is_success() || !compat::ApiFailure::of(res.status()).is_unsupported() {
+            return Ok(res);
+        }
+
+        // Self-built servers sometimes reject parameters they do not implement
+        // instead of ignoring them (`Fields`, grouping flags, …). Retry with
+        // progressively smaller parameter sets before surfacing the failure.
+        for stage in compat::DEGRADE_STAGES {
+            let reduced = compat::strip(params, stage);
+            if reduced.len() == params.len() {
+                continue;
+            }
+            tracing::debug!(
+                "{path} answered {}; retrying without {stage:?}",
+                res.status()
+            );
+            res = self.get_once(path, &reduced).await?;
+            if res.status().is_success() || !compat::ApiFailure::of(res.status()).is_unsupported() {
+                break;
+            }
+        }
+
+        Ok(res)
+    }
+
+    async fn get_once(&self, path: &str, params: &[(&str, &str)]) -> Result<Response> {
+        let request = self.prepare_request(Method::GET, path, params)?;
+        match self.send_request(request).await {
+            Ok(res) => Ok(res),
+            Err(e) => {
+                // A dead line should not make the whole UI fail: move to another
+                // configured line once and retry the same request.
+                if !self.try_failover().await {
+                    return Err(e);
+                }
+                let request = self.prepare_request(Method::GET, path, params)?;
+                self.send_request(request).await
+            }
+        }
+    }
+
+    async fn retry_with_style(
+        &self, path: &str, params: &[(&str, &str)], style: AuthStyle,
+    ) -> Result<Response> {
+        let session = self.session();
+        let (url, _) = session
+            .url_headers
+            .as_ref()
+            .context("Client not initialized")?;
+        let headers = build_headers(
+            Some(&session.account.user_id),
+            Some(&session.account.access_token),
+            style,
+        )?;
+        let request = self
+            .client
+            .request(Method::GET, url.join(path)?)
+            .query(params)
+            .headers(headers);
+        self.send_request(request).await
+    }
+
+    fn remember_auth_style(&self, style: AuthStyle) {
+        let mut session = Session::clone(&self.session());
+        if session.profile.auth == style {
+            return;
+        }
+        session.profile.auth = style;
+        let profile = session.profile.clone();
+        let servername = session.account.servername.clone();
+        self.session.store(Arc::new(session));
+        let _ = SETTINGS.update_account_profile(&servername, Some(profile));
     }
 
     pub async fn request_picture(&self, path: &str, params: &[(&str, &str)]) -> Result<Response> {
@@ -344,16 +902,6 @@ impl JellyfinClient {
             .headers(headers.clone()))
     }
 
-    fn prepare_unauthenticated_request(
-        &self, method: Method, server: &str, port: &str, server_type: ServerType, path: &str,
-    ) -> Result<RequestBuilder> {
-        let url = build_base_url(build_url(server, port)?, server_type)?.join(path)?;
-        Ok(self
-            .client
-            .request(method, url)
-            .headers(build_headers(None, None, server_type)?))
-    }
-
     fn prepare_request_headers(
         &self, method: Method, path: &str, params: &[(&str, &str)], content_type: &str,
     ) -> Result<RequestBuilder> {
@@ -372,11 +920,32 @@ impl JellyfinClient {
     }
 
     async fn send_request(&self, request: RequestBuilder) -> Result<Response> {
-        let _permit = self.semaphore.acquire().await?;
-        request
-            .send()
-            .await
-            .map_err(|e| anyhow!(e.to_user_facing()))
+        // Limit concurrency per host on top of the global budget: home pages fan
+        // out to many endpoints at once and a single low powered NAS would
+        // otherwise get the whole burst.
+        let host = request
+            .try_clone()
+            .and_then(|builder| builder.build().ok())
+            .and_then(|request| request.url().host_str().map(str::to_string));
+        let host_permit = match host {
+            Some(host) => Some(self.host_semaphore(&host).acquire_owned().await?),
+            None => None,
+        };
+
+        let _global = self.semaphore.acquire().await?;
+        let res = request.send().await;
+        drop(host_permit);
+
+        res.map_err(|e| anyhow!(e.to_user_facing()))
+    }
+
+    fn host_semaphore(&self, host: &str) -> Arc<tokio::sync::Semaphore> {
+        let limit = (SETTINGS.threads().max(1) as usize).max(2);
+        let mut hosts = self.hosts.lock().unwrap_or_else(|e| e.into_inner());
+        hosts
+            .entry(host.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Semaphore::new(limit)))
+            .clone()
     }
 
     pub async fn get_current_user(&self) -> Result<User> {
@@ -389,25 +958,141 @@ impl JellyfinClient {
     pub async fn login(
         &self, server: &str, port: &str, server_type: ServerType, username: &str, password: &str,
     ) -> Result<LoginResponse> {
-        let body = json!({
-            "Username": username,
-            "Pw": password
-        });
-        let request = self
-            .prepare_unauthenticated_request(
-                Method::POST,
-                server,
-                port,
-                server_type,
-                "Users/AuthenticateByName",
-            )?
-            .json(&body);
         Ok(self
-            .send_request(request)
+            .login_resolved(server, port, server_type, username, password)
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .0)
+    }
+
+    /// Like [`Self::login`], but also returns the discovered [`ServerProfile`]
+    /// (resolved base URL, flavour, authorization style, capabilities) so the
+    /// caller can persist it on the account and skip probing on next start.
+    ///
+    /// Every candidate root and both authorization dialects are tried, because
+    /// stock Emby, stock Jellyfin and self-built servers disagree on all of them.
+    pub async fn login_resolved(
+        &self, server: &str, port: &str, hint: ServerType, username: &str, password: &str,
+    ) -> Result<(LoginResponse, ServerProfile)> {
+        let raw = build_url(server, port)?.to_string();
+
+        // Probe once to learn the flavour; probing also yields the base that
+        // answers like an Emby server, which is then tried first.
+        let mut bases: Vec<(Url, Flavor)> = Vec::new();
+        match compat::resolve_base(&self.client, &raw, hint).await {
+            Ok(resolved) => {
+                let flavor = compat::detect_flavor(&resolved.info);
+                bases.push((resolved.base, flavor));
+            }
+            Err(e) => warn!("probe for {raw} failed ({e}); trying candidates blindly"),
+        }
+        for base in compat::candidates(&raw, hint) {
+            if !bases.iter().any(|(known, _)| known == &base) {
+                bases.push((base, Flavor::Emby));
+            }
+        }
+
+        let mut last_error = String::from("no candidate answered");
+        for (base, flavor) in bases {
+            for style in AuthStyle::Auto.attempts() {
+                let Ok(headers) = build_headers(None, None, style) else {
+                    continue;
+                };
+                let Ok(url) = base.join("Users/AuthenticateByName") else {
+                    continue;
+                };
+                let request = self
+                    .client
+                    .request(Method::POST, url)
+                    .headers(headers)
+                    .json(&json!({
+                        "Username": username,
+                        "Pw": password
+                    }));
+
+                let res = match self.send_request(request).await {
+                    Ok(res) => res,
+                    Err(e) => {
+                        last_error = format!("{base}: {e}");
+                        continue;
+                    }
+                };
+
+                if !res.status().is_success() {
+                    last_error = format!("{base} answered {} ({style:?})", res.status());
+                    continue;
+                }
+
+                let login: LoginResponse = res.json().await.context("parse login response")?;
+
+                // The login call itself is unauthenticated, so the dialect that
+                // got us a token is not necessarily the one that accepts it.
+                // Prove the credential before storing it.
+                let auth = self
+                    .probe_auth_style(&base, &login.user.id, &login.access_token)
+                    .await
+                    .unwrap_or(AuthStyle::Auto);
+                tracing::info!("authorization dialect for {base}: {auth:?}");
+
+                let auth_headers =
+                    build_headers(Some(&login.user.id), Some(&login.access_token), auth)?;
+                let caps = compat::probe_caps(
+                    &self.client,
+                    &base,
+                    &auth_headers,
+                    Some(&login.user.id),
+                    flavor,
+                )
+                .await;
+                let profile = ServerProfile {
+                    base: base.to_string(),
+                    flavor,
+                    auth,
+                    caps,
+                    lines: vec![compat::Line {
+                        label: compat::line_label(&base),
+                        url: base.to_string(),
+                    }],
+                    preferred: None,
+                };
+                tracing::info!("logged in to {base} (flavour {flavor:?}, auth {style:?})");
+                return Ok((login, profile));
+            }
+        }
+
+        bail!("Login failed: {last_error}")
+    }
+
+    /// Find the dialect this server actually accepts for authenticated calls.
+    ///
+    /// `Auto` (which sends every header) is tried first: when it works there is
+    /// no need to know which single header the server read.
+    async fn probe_auth_style(&self, base: &Url, user_id: &str, token: &str) -> Option<AuthStyle> {
+        let Ok(url) = base.join(&format!("Users/{user_id}")) else {
+            return None;
+        };
+
+        for style in [AuthStyle::Auto, AuthStyle::Emby, AuthStyle::MediaBrowser] {
+            let Ok(headers) = build_headers(Some(user_id), Some(token), style) else {
+                continue;
+            };
+            let res = self
+                .client
+                .get(url.clone())
+                .headers(headers)
+                .timeout(compat::PROBE_TIMEOUT)
+                .send()
+                .await;
+            match res {
+                Ok(res) if res.status().is_success() => return Some(style),
+                Ok(res) => {
+                    tracing::debug!("auth probe with {style:?} answered {}", res.status());
+                }
+                Err(e) => {
+                    tracing::debug!("auth probe with {style:?} failed: {e}");
+                }
+            }
+        }
+        None
     }
 
     pub fn get_item_direct_play_url(
@@ -425,13 +1110,11 @@ impl JellyfinClient {
         if let Some(play_session_id) = play_session_id {
             query_pairs.append_pair("PlaySessionId", play_session_id);
         }
-        match self.server_type() {
-            ServerType::Emby => {
-                query_pairs.append_pair("api_key", &s.account.access_token);
-            }
-            ServerType::Jellyfin => {
-                query_pairs.append_pair("ApiKey", &s.account.access_token);
-            }
+        // Emby-family servers read `api_key`, Jellyfin accepts both spellings.
+        if s.profile.flavor.is_emby_family() || matches!(self.server_type(), ServerType::Emby) {
+            query_pairs.append_pair("api_key", &s.account.access_token);
+        } else {
+            query_pairs.append_pair("ApiKey", &s.account.access_token);
         }
         drop(query_pairs);
         Ok(url.to_string())
@@ -444,10 +1127,7 @@ impl JellyfinClient {
         let filter_str = filter.join(",");
         let path = format!("Users/{}/Items", s.account.user_id);
         let mut params = vec![
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-            ),
+            ("Fields", fields::LIST),
             ("IncludeItemTypes", &filter_str),
             ("IncludeSearchTypes", &filter_str),
             ("StartIndex", start_index),
@@ -471,10 +1151,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = format!("Shows/{id}/Episodes");
         let params = [
-            (
-                "Fields",
-                "Overview,PrimaryImageAspectRatio,PremiereDate,ProductionYear,SyncStatus",
-            ),
+            ("Fields", fields::SYNC),
             ("Limit", "50"),
             ("StartIndex", &start_index.to_string()),
             ("ImageTypeLimit", "1"),
@@ -488,10 +1165,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = format!("Shows/{id}/Episodes");
         let params = [
-            (
-                "Fields",
-                "Overview,PrimaryImageAspectRatio,PremiereDate,ProductionYear,SyncStatus",
-            ),
+            ("Fields", fields::SYNC),
             ("ImageTypeLimit", "1"),
             ("SeasonId", season_id),
             ("UserId", &s.account.user_id),
@@ -523,10 +1197,7 @@ impl JellyfinClient {
         let path = format!("Users/{}/Items/Resume", s.account.user_id);
         let params = [
             ("Recursive", "true"),
-            (
-                "Fields",
-                "Overview,BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,CommunityRating",
-            ),
+            ("Fields", fields::RESUME_RATING),
             ("EnableImageTypes", "Primary,Backdrop,Thumb,Banner"),
             ("ImageTypeLimit", "1"),
             ("MediaTypes", "Video"),
@@ -746,10 +1417,7 @@ impl JellyfinClient {
             ("SortBy", "ProductionYear,SortName"),
             ("EnableImageTypes", "Primary,Backdrop,Thumb,Banner"),
             ("SortOrder", "Descending"),
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear",
-            ),
+            ("Fields", fields::CORE_YEAR),
             ("AlbumArtistIds", artist_id),
             ("ExcludeItemIds", id),
         ];
@@ -760,7 +1428,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = "Shows/NextUp".to_string();
         let params = [
-            ("Fields", "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio"),
+            ("Fields", fields::CORE),
             ("Limit", "1"),
             ("ImageTypeLimit", "1"),
             ("SeriesId", series_id),
@@ -818,8 +1486,11 @@ impl JellyfinClient {
     }
 
     pub async fn get_skippable_segments(&self, id: &str) -> Result<MediaSegmentList> {
-        if !self.is_jellyfin() {
-            bail!("Skippable segments are not supported on Emby");
+        // Capability, not server type: Emby has no MediaSegments endpoint, but a
+        // fork may, and a Jellyfin build may have it disabled. Returning an empty
+        // list keeps the player overlay working instead of failing it.
+        if !self.caps().segments {
+            return Ok(MediaSegmentList::default());
         }
         let path = format!("MediaSegments/{id}");
         let params = [
@@ -893,10 +1564,7 @@ impl JellyfinClient {
         let path = format!("Users/{}/Items/Latest", s.account.user_id);
         let params = [
             ("Limit", "16"),
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,CommunityRating",
-            ),
+            ("Fields", fields::CORE_YEAR_RATING),
             ("ParentId", id),
             ("ImageTypeLimit", "1"),
             ("EnableImageTypes", "Primary,Backdrop,Thumb,Banner"),
@@ -935,10 +1603,7 @@ impl JellyfinClient {
             ListType::All | ListType::Liked | ListType::Tags | ListType::BoxSet => {
                 vec![
                     ("Limit", "50"),
-                    (
-                        "Fields",
-                        "Overview,BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-                    ),
+                    ("Fields", fields::LIST_OVERVIEW),
                     ("ParentId", id),
                     ("ImageTypeLimit", "1"),
                     ("StartIndex", &start_string),
@@ -956,10 +1621,7 @@ impl JellyfinClient {
             }
             ListType::Resume => {
                 vec![
-                    (
-                        "Fields",
-                        "Overview,BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear",
-                    ),
+                    ("Fields", fields::RESUME),
                     ("ParentId", id),
                     ("EnableImageTypes", "Primary,Backdrop,Thumb,Banner"),
                     ("ImageTypeLimit", "1"),
@@ -973,7 +1635,7 @@ impl JellyfinClient {
                 ]
             }
             ListType::Genres => vec![
-                ("Fields", "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio"),
+                ("Fields", fields::CORE),
                 ("IncludeItemTypes", include_item_type),
                 ("StartIndex", &start_string),
                 ("ImageTypeLimit", "1"),
@@ -1002,10 +1664,7 @@ impl JellyfinClient {
         let start_string = start.to_string();
         let mut params = vec![
             ("Limit", "50"),
-            (
-                "Fields",
-                "Overview,BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-            ),
+            ("Fields", fields::LIST_OVERVIEW),
             ("ImageTypeLimit", "1"),
             ("StartIndex", &start_string),
             ("Recursive", "true"),
@@ -1086,6 +1745,34 @@ impl JellyfinClient {
     }
 
     pub async fn position_back(&self, back: &Back, backtype: BackType) -> Result<()> {
+        let kind = match backtype {
+            BackType::Start => ReportKind::Start,
+            BackType::Stop => ReportKind::Stop,
+            BackType::Back => ReportKind::Progress,
+        };
+        // A session is identified by item + media source + play session, so
+        // switching episodes (or restarting one) resets the throttle.
+        let key = format!(
+            "{}|{}|{}",
+            back.id,
+            back.mediasourceid,
+            back.playsessionid.as_deref().unwrap_or_default()
+        );
+
+        // Holding the lock across the request serialises reports: a `Stop` can
+        // never overtake an in-flight `Progress`.
+        let mut gate = self.report_gate.lock().await;
+        if !gate.should_send(kind, &key, back.tick) {
+            tracing::trace!("{kind:?} report for {key} at {} deduplicated", back.tick);
+            return Ok(());
+        }
+
+        let result = self.send_position_back(back, backtype).await;
+        gate.record(kind, &key, back.tick, result.is_ok());
+        result
+    }
+
+    async fn send_position_back(&self, back: &Back, backtype: BackType) -> Result<()> {
         let path = match backtype {
             BackType::Start => "Sessions/Playing",
             BackType::Stop => "Sessions/Playing/Stopped",
@@ -1126,10 +1813,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = format!("Items/{id}/Similar");
         let params = [
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-            ),
+            ("Fields", fields::LIST),
             ("UserId", &s.account.user_id),
             ("ImageTypeLimit", "1"),
             ("Limit", "12"),
@@ -1165,10 +1849,7 @@ impl JellyfinClient {
         let start_string = start_index.to_string();
         let path = format!("Users/{}/Items", s.account.user_id);
         let mut params = vec![
-            (
-                "Fields",
-                "Overview,PrimaryImageAspectRatio,ProductionYear,CommunityRating",
-            ),
+            ("Fields", fields::OVERVIEW_RATING),
             ("PersonIds", id),
             ("Recursive", "true"),
             ("CollapseBoxSetItems", "false"),
@@ -1189,10 +1870,7 @@ impl JellyfinClient {
     pub async fn get_continue_play_list(&self, parent_id: &str) -> Result<List> {
         let s = self.session();
         let params = [
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,Overview",
-            ),
+            ("Fields", fields::CORE_OVERVIEW),
             ("Limit", "40"),
             ("ImageTypeLimit", "1"),
             ("SeriesId", parent_id),
@@ -1245,10 +1923,7 @@ impl JellyfinClient {
         let limit_string = limit.to_string();
         let start_string = start.to_string();
         let mut params = vec![
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,CommunityRating",
-            ),
+            ("Fields", fields::CORE_YEAR_RATING),
             ("Filters", "IsFavorite"),
             ("Recursive", "true"),
             ("CollapseBoxSetItems", "false"),
@@ -1276,10 +1951,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = format!("Users/{}/Items", s.account.user_id);
         let params = [
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,CommunityRating",
-            ),
+            ("Fields", fields::CORE_RATING),
             ("Limit", "12"),
             ("ListItemIds", id),
             ("Recursive", "true"),
@@ -1293,10 +1965,7 @@ impl JellyfinClient {
         let s = self.session();
         let path = format!("Users/{}/Items", s.account.user_id);
         let params = [
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-            ),
+            ("Fields", fields::LIST),
             ("ImageTypeLimit", "1"),
             ("ParentId", parent_id),
             ("SortBy", "DisplayOrder"),
@@ -1315,10 +1984,7 @@ impl JellyfinClient {
         let start_index_string = start_index.to_string();
         let sort_by = format!("IsFolder,{sort_by}");
         let mut params = vec![
-            (
-                "Fields",
-                "BasicSyncInfo,CanDelete,PrimaryImageAspectRatio,ProductionYear,Status,EndDate,CommunityRating",
-            ),
+            ("Fields", fields::LIST),
             ("StartIndex", &start_index_string),
             ("ImageTypeLimit", "1"),
             ("Limit", "50"),
@@ -1447,19 +2113,10 @@ impl JellyfinClient {
     pub async fn get_server_info_public(
         &self, server: &str, port: &str, server_type: ServerType,
     ) -> Result<PublicServerInfo> {
-        let request = self.prepare_unauthenticated_request(
-            Method::GET,
-            server,
-            port,
-            server_type,
-            "System/Info/Public",
-        )?;
-        Ok(self
-            .send_request(request)
+        let raw = build_url(server, port)?.to_string();
+        Ok(compat::resolve_base(&self.client, &raw, server_type)
             .await?
-            .error_for_status()?
-            .json()
-            .await?)
+            .info)
     }
 
     pub async fn shut_down(&self) -> Result<Response> {
@@ -1583,6 +2240,18 @@ impl JellyfinClient {
 /// emos/Meridian) hand out paths that already contain the base path: with a
 /// base of `https://host/emby/`, `"/emby/emya/subtitle?..."` must not become
 /// `/emby/emby/emya/subtitle?...`, which answers 404.
+/// Append one line if it is not already listed.
+fn push_line(lines: &mut Vec<compat::Line>, url: &Url) {
+    let text = url.to_string();
+    if lines.iter().any(|line| line.url == text) {
+        return;
+    }
+    lines.push(compat::Line {
+        label: compat::line_label(url),
+        url: text,
+    });
+}
+
 fn url_relative_to_base<'a>(base_path: &str, path: &'a str) -> &'a str {
     let base_path = base_path.trim_matches('/');
     let trimmed = path.trim_start_matches('/');
@@ -1653,6 +2322,7 @@ mod tests {
                     user_id: response.user.id,
                     access_token: response.access_token,
                     server_type: Some(ServerType::Jellyfin),
+                    profile: None,
                 };
                 let _ = JELLYFIN_CLIENT.init(&account).await;
             }
@@ -1672,6 +2342,92 @@ mod tests {
                 eprintln!("{}", e.to_user_facing());
             }
         }
+    }
+
+    #[test]
+    fn every_dialect_sends_the_emby_token() {
+        // A login succeeds without any credential, so the dialect that "works"
+        // at login proves nothing. Every dialect must carry `X-Emby-Token`,
+        // otherwise Emby answers 401 to everything afterwards.
+        for style in [AuthStyle::Emby, AuthStyle::MediaBrowser, AuthStyle::Auto] {
+            let headers =
+                build_headers_with(Some("user"), Some("token"), style, "device").expect("headers");
+            assert_eq!(
+                headers.get("X-Emby-Token").and_then(|v| v.to_str().ok()),
+                Some("token"),
+                "{style:?} dropped X-Emby-Token"
+            );
+        }
+    }
+
+    #[test]
+    fn auto_style_sends_both_scheme_headers() {
+        let headers =
+            build_headers_with(Some("user"), Some("token"), AuthStyle::Auto, "device").expect("h");
+
+        let authorization = headers
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("Authorization header");
+        assert!(authorization.starts_with("MediaBrowser "));
+        assert!(authorization.contains("Token=token"));
+
+        let emby = headers
+            .get("X-Emby-authorization")
+            .and_then(|v| v.to_str().ok())
+            .expect("X-Emby-authorization header");
+        assert!(emby.starts_with("Emby "));
+    }
+
+    #[test]
+    fn unauthenticated_requests_have_no_token_header() {
+        let headers = build_headers_with(None, None, AuthStyle::Auto, "device").expect("h");
+        assert!(headers.get("X-Emby-Token").is_none());
+    }
+
+    #[test]
+    fn report_gate_dedupes_progress_and_stop() {
+        let mut gate = ReportGate::default();
+        let key = "item|source|session";
+
+        assert!(gate.should_send(ReportKind::Start, key, 0));
+        gate.record(ReportKind::Start, key, 0, true);
+
+        // Same position: the burst of reports after a seek must not go out.
+        assert!(!gate.should_send(ReportKind::Progress, key, 0));
+
+        // Real playback moved on.
+        assert!(gate.should_send(ReportKind::Progress, key, PROGRESS_MIN_DELTA_TICKS));
+        gate.record(ReportKind::Progress, key, PROGRESS_MIN_DELTA_TICKS, true);
+
+        // Seeking backwards is significant too.
+        assert!(gate.should_send(ReportKind::Progress, key, 0));
+
+        // A different session always reports.
+        assert!(gate.should_send(ReportKind::Progress, "other", 0));
+
+        // `Stop` goes through exactly once (page exit, then window close).
+        assert!(gate.should_send(ReportKind::Stop, key, 0));
+        gate.record(ReportKind::Stop, key, 0, true);
+        assert!(!gate.should_send(ReportKind::Stop, key, 0));
+
+        // …and does not block the next playback of the same item.
+        assert!(gate.should_send(ReportKind::Start, key, 0));
+    }
+
+    #[test]
+    fn report_gate_backs_off_after_a_failure() {
+        let mut gate = ReportGate::default();
+        let key = "k";
+
+        gate.record(ReportKind::Start, key, 0, true);
+        gate.record(ReportKind::Progress, key, 100_000_000, false);
+
+        // The server rejected the last report: do not retry on every tick.
+        assert!(!gate.should_send(ReportKind::Progress, key, 200_000_000));
+
+        // `Stop` is never suppressed by a failure or by the throttle.
+        assert!(gate.should_send(ReportKind::Stop, key, 200_000_000));
     }
 
     #[test]
@@ -1709,6 +2465,7 @@ mod tests {
                     user_id: response.user.id,
                     access_token: response.access_token,
                     server_type: Some(ServerType::Jellyfin),
+                    profile: None,
                 };
                 let _ = JELLYFIN_CLIENT.init(&account).await;
             }

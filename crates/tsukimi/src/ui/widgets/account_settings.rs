@@ -482,6 +482,11 @@ impl AccountSettings {
     }
 
     #[template_callback]
+    fn server_lines_activated_cb(&self) {
+        super::server_lines::present(self);
+    }
+
+    #[template_callback]
     fn preferred_subpage_activated_cb(&self) {
         let subpage = self.imp().preferred_version_subpage.get();
         self.push_subpage(&subpage);

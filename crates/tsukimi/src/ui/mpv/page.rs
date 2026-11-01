@@ -1698,6 +1698,31 @@ impl MPVPage {
         glib::ControlFlow::Continue
     }
 
+    /// Report the final progress and wait (briefly) for it to land.
+    ///
+    /// Called when the window is closed: without it the server keeps a stale
+    /// session and the resume position is lost. Bounded by a timeout so a dead
+    /// or very slow server can never hang the close.
+    pub fn drain_progress(&self) {
+        let Some(back) = self.position_back() else {
+            return;
+        };
+
+        let sent = crate::client::runtime::runtime().block_on(async move {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(5),
+                JELLYFIN_CLIENT.position_back(&back, BackType::Stop),
+            )
+            .await
+        });
+
+        match sent {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => tracing::warn!("failed to report final progress: {e}"),
+            Err(_) => tracing::warn!("timed out reporting final progress"),
+        }
+    }
+
     fn position_back(&self) -> Option<Back> {
         let position = self.imp().last_playback_position.get();
         let mut back = self.imp().back.borrow().as_ref()?.to_owned();

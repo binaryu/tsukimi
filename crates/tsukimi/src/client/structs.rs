@@ -517,12 +517,17 @@ pub struct ServerInfo {
     pub wan_address: String,
 }
 
-#[derive(Serialize, Deserialize, Clone, Default)]
+#[derive(Serialize, Deserialize, Clone, Debug, Default)]
 pub struct PublicServerInfo {
     #[serde(rename = "ServerName")]
     pub server_name: String,
     #[serde(rename = "Version")]
     pub version: String,
+    /// Not every Emby-compatible server reports it; used only for flavour hints.
+    #[serde(rename = "ProductName", default)]
+    pub product_name: Option<String>,
+    #[serde(rename = "Id", default)]
+    pub id: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Clone, Default)]

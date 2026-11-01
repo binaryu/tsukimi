@@ -9,7 +9,10 @@ use serde::{
 };
 use url::Url;
 
-use crate::ui::provider::descriptor::VecSerialize;
+use crate::{
+    client::compat::ServerProfile,
+    ui::provider::descriptor::VecSerialize,
+};
 
 #[derive(Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 pub enum ServerType {
@@ -31,7 +34,7 @@ impl ServerType {
     }
 }
 
-#[derive(Serialize, Deserialize, Clone, PartialEq, Default)]
+#[derive(Serialize, Deserialize, Clone, Default)]
 pub struct Account {
     pub servername: String,
     pub server: String,
@@ -41,6 +44,61 @@ pub struct Account {
     pub user_id: String,
     pub access_token: String,
     pub server_type: Option<ServerType>,
+    /// Compatibility profile discovered by probing the server (base URL,
+    /// flavour, authorization style, capabilities). Accounts created before this
+    /// field existed have `None` and are probed on first use.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ServerProfile>,
+}
+
+/// Identity of an account is its connection data **including the token**.
+///
+/// The compatibility profile is derived state and must not make two accounts
+/// compare unequal, but the access token must: `edit_account` treats
+/// "already present" as "nothing to do", so a re-login that changed only the
+/// token would be silently dropped and every request would keep failing with 401
+/// using the stale credential.
+impl PartialEq for Account {
+    fn eq(&self, other: &Self) -> bool {
+        self.servername == other.servername
+            && self.server == other.server
+            && self.username == other.username
+            && self.port == other.port
+            && self.user_id == other.user_id
+            && self.access_token == other.access_token
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn account(token: &str) -> Account {
+        Account {
+            password: String::new(),
+            servername: "nas".into(),
+            server: "https://nas.example".into(),
+            username: "user".into(),
+            port: "8096".into(),
+            user_id: "uid".into(),
+            access_token: token.into(),
+            server_type: Some(ServerType::Emby),
+            profile: None,
+        }
+    }
+
+    #[test]
+    fn a_new_token_makes_the_account_different() {
+        // Otherwise a re-login is dropped and the client keeps using the old token.
+        assert!(account("old") != account("new"));
+    }
+
+    #[test]
+    fn the_derived_profile_does_not_affect_identity() {
+        let mut other = account("token");
+        other.profile = Some(Default::default());
+        assert!(account("token") == other);
+    }
 }
 
 impl Account {
