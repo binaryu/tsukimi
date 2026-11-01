@@ -43,12 +43,18 @@ jobs:
 
   arch:
     name: Arch
+    # The Arch package is the only reason a release needs this job, and it costs
+    # ten minutes of clean-container compilation. Building it for every push and
+    # pull request buys nothing: those runs do not publish anything.
+    if: github.ref_type == 'tag'
     uses: ./.github/workflows/build_arch.yml
     secrets: inherit
 
   artifacts:
     name: Artifacts
-    if: ${{ github.event_name != 'pull_request' }}
+    # Keep uploading the Linux tarballs for branch builds, where `arch` is
+    # skipped on purpose.
+    if: ${{ !cancelled() && github.event_name != 'pull_request' && needs.linux.result == 'success' }}
     uses: ./.github/workflows/artifacts.yml
     needs: [linux, arch]
     secrets: inherit
