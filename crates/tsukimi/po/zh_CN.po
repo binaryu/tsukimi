@@ -2219,6 +2219,39 @@ msgstr ""
 "Gracealina clover <zhiweishuisheng@gmail.com>\n"
 "dyphire <qimoge@gmail.com>"
 
+#: crates/tsukimi/resources/ui/item.ui
+msgid "External playback"
+msgstr "外部播放"
+
+#: crates/tsukimi/resources/ui/item.ui
+msgid "Copy playback link"
+msgstr "复制播放链接"
+
+#: crates/tsukimi/resources/ui/item.ui
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "Open in external player"
+msgstr "用外部播放器打开"
+
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "Playback link copied. It contains credentials; do not share it."
+msgstr "已复制播放链接。链接含访问凭据，请勿分享。"
+
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "Playback selection changed. Please try again."
+msgstr "播放选择已改变，请重试。"
+
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "No HTTP playback link is available for this source."
+msgstr "该视频源没有可用的 HTTP 播放链接。"
+
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "Choose a player that supports network URLs, or copy the playback link."
+msgstr "请选择支持网络链接的播放器，或复制播放链接。"
+
+#: crates/tsukimi/src/ui/widgets/item.rs
+msgid "Could not open the player. Try copying the playback link."
+msgstr "无法打开播放器，请尝试复制播放链接。"
+
 #~ msgid "Danmaku disabled"
 #~ msgstr "弹幕停用"
 

@@ -18,6 +18,7 @@ use crate::{
         error::UserFacingError,
         jellyfin_client::JELLYFIN_CLIENT,
         picture_source::PictureSource,
+        stream_url::media_source_url,
         structs::*,
     },
     ui::{
@@ -167,6 +168,9 @@ pub(crate) mod imp {
 
         #[template_child]
         pub playbutton: TemplateChild<gtk::Button>,
+        #[template_child]
+        pub external_playback: TemplateChild<gtk::MenuButton>,
+        pub external_playback_busy: Cell<bool>,
         #[template_child]
         pub playbutton_stack: TemplateChild<gtk::Stack>,
         #[template_child]
@@ -1336,6 +1340,126 @@ impl ItemPage {
     }
 
     #[template_callback]
+    async fn copy_stream_url_cb(&self) {
+        self.export_stream(false).await;
+    }
+
+    #[template_callback]
+    async fn open_external_player_cb(&self) {
+        self.export_stream(true).await;
+    }
+
+    async fn export_stream(&self, open_player: bool) {
+        let imp = self.imp();
+        if imp.external_playback_busy.replace(true) {
+            return;
+        }
+        imp.external_playback.popdown();
+        imp.external_playback.set_sensitive(false);
+        let result = self.external_stream_url().await;
+        imp.external_playback_busy.set(false);
+        imp.external_playback
+            .set_sensitive(imp.playbutton.is_sensitive());
+        match result {
+            Ok(url) if open_player => self.choose_external_player(&url).await,
+            Ok(url) => {
+                self.clipboard().set_text(&url);
+                self.toast(gettext(
+                    "Playback link copied. It contains credentials; do not share it.",
+                ));
+            }
+            Err(error) => self.toast(error.to_user_facing()),
+        }
+    }
+
+    fn selected_media_source_id(&self) -> Option<String> {
+        self.imp()
+            .namedropdown
+            .selected_item()
+            .and_downcast::<glib::BoxedAnyObject>()
+            .and_then(|obj| obj.borrow::<DropdownList>().id.clone())
+    }
+
+    async fn external_stream_url(&self) -> anyhow::Result<String> {
+        use anyhow::{
+            Context,
+            bail,
+        };
+
+        let source_id = self
+            .selected_media_source_id()
+            .context(gettext("No video source found"))?;
+        let item_id = self.current_item().unwrap_or(self.item()).id();
+        let request_id = item_id.clone();
+        let request_source = source_id.clone();
+        let account = JELLYFIN_CLIENT.session().account.clone();
+        let base = JELLYFIN_CLIENT.current_base();
+        let playback = spawn_tokio(async move {
+            JELLYFIN_CLIENT
+                .get_playbackinfo(&request_id, None, Some(request_source), true)
+                .await
+        })
+        .await?;
+
+        // Do not export a response for an account/episode/line changed mid-request.
+        if JELLYFIN_CLIENT.session().account != account
+            || JELLYFIN_CLIENT.current_base() != base
+            || self.current_item().unwrap_or(self.item()).id() != item_id
+            || self.selected_media_source_id().as_deref() != Some(source_id.as_str())
+        {
+            bail!(gettext("Playback selection changed. Please try again."));
+        }
+        let source = playback
+            .media_sources
+            .iter()
+            .find(|source| source.id == source_id)
+            .context(gettext("No media source found"))?;
+        let (url, _) = media_source_url(source, &item_id, playback.play_session_id.as_deref())
+            .context(gettext("No media source found"))?;
+        let parsed = url::Url::parse(&url)?;
+        if !matches!(parsed.scheme(), "http" | "https") || parsed.host_str().is_none() {
+            bail!(gettext(
+                "No HTTP playback link is available for this source."
+            ));
+        }
+        Ok(url)
+    }
+
+    // GTK's video app chooser avoids sending an HTTP stream to the web browser.
+    #[allow(deprecated)]
+    async fn choose_external_player(&self, url: &str) {
+        let dialog = gtk::AppChooserDialog::for_content_type(
+            Some(&self.window()),
+            gtk::DialogFlags::MODAL,
+            "video/mp4",
+        );
+        dialog.set_heading(&gettext("Open in external player"));
+        let response = dialog.run_future().await;
+        let app = dialog.app_info();
+        dialog.close();
+        if response != gtk::ResponseType::Ok {
+            return;
+        }
+        let Some(app) = app.filter(|app| app.supports_uris()) else {
+            self.toast(gettext(
+                "Choose a player that supports network URLs, or copy the playback link.",
+            ));
+            return;
+        };
+        let context = gtk::prelude::WidgetExt::display(self).app_launch_context();
+        if app
+            .launch_uris_future(&[url], Some(&context))
+            .await
+            .is_err()
+        {
+            // Launch errors can include the credential-bearing URL.
+            self.toast(gettext(
+                "Could not open the player. Try copying the playback link.",
+            ));
+        }
+    }
+
+    #[template_callback]
     fn on_rightbutton_clicked(&self) {
         self.scroll_controls_anime::<true>();
     }
@@ -1424,4 +1548,47 @@ pub struct SelectedVideoSubInfo {
     pub sub_index: i64,
     pub video_index: i64,
     pub media_source_id: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "GTK needs a separate process and Meson resources; run alone with --ignored"]
+    fn external_playback_menu_follows_playback_readiness() {
+        adw::init().expect("GTK test display must be available");
+        let resource_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../build/crates/tsukimi/resources/tsukimi.gresource");
+        let resources = gio::Resource::load(resource_path).expect("build Meson resources first");
+        gio::resources_register(&resources);
+        crate::ui::init();
+
+        let page = ItemPage::new(&TuItem::default());
+        assert!(!page.imp().external_playback.is_sensitive());
+        page.imp().playbutton.set_sensitive(true);
+        assert!(page.imp().external_playback.is_sensitive());
+        page.imp().playbutton.set_sensitive(false);
+        assert!(!page.imp().external_playback.is_sensitive());
+
+        let menu = page
+            .imp()
+            .external_playback
+            .popover()
+            .unwrap()
+            .child()
+            .unwrap();
+        let copy = menu
+            .first_child()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        let open = copy
+            .next_sibling()
+            .unwrap()
+            .downcast::<gtk::Button>()
+            .unwrap();
+        assert_eq!(copy.label().as_deref(), Some("Copy playback link"));
+        assert_eq!(open.label().as_deref(), Some("Open in external player"));
+    }
 }

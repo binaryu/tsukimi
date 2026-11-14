@@ -12,6 +12,7 @@ use std::{
 
 use adw::prelude::*;
 use gettextrs::gettext;
+use gtk::glib;
 
 use crate::{
     client::jellyfin_client::{
@@ -80,12 +81,18 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
     auto_row.set_activatable(true);
     auto_row.add_prefix(&image("starred-symbolic"));
     auto_row.add_suffix(&image("go-next-symbolic"));
-    {
-        let overlay = overlay.clone();
-        let lines_group = lines_group.clone();
-        let labels = labels.clone();
-        let dialog = dialog.clone();
-        auto_row.connect_activated(move |_| {
+    auto_row.connect_activated(gtk::glib::clone!(
+        #[weak]
+        overlay,
+        #[weak]
+        lines_group,
+        #[strong]
+        labels,
+        #[weak]
+        dialog,
+        move |row| {
+            row.set_sensitive(false);
+            let row = row.clone();
             let overlay = overlay.clone();
             let lines_group = lines_group.clone();
             let labels = labels.clone();
@@ -93,6 +100,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
             spawn(async move {
                 let result =
                     spawn_tokio(async { JELLYFIN_CLIENT.use_automatic_line().await }).await;
+                row.set_sensitive(true);
                 match result {
                     Ok(()) => {
                         toast(&overlay, gettext("Switched to the fastest line"));
@@ -101,16 +109,17 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
                     Err(e) => toast(&overlay, e.to_string()),
                 }
             });
-        });
-    }
+        }
+    ));
     actions_group.add(&auto_row);
 
     // --- measure everything ---
-    {
-        let overlay = overlay.clone();
-        let labels = labels.clone();
-        let button = test_button.clone();
-        test_button.connect_clicked(move |_| {
+    test_button.connect_clicked(gtk::glib::clone!(
+        #[weak]
+        overlay,
+        #[strong]
+        labels,
+        move |button| {
             button.set_sensitive(false);
             let overlay = overlay.clone();
             let labels = labels.clone();
@@ -134,16 +143,22 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
                 );
                 button.set_sensitive(true);
             });
-        });
-    }
+        }
+    ));
 
     // --- re-discover ---
-    {
-        let overlay = overlay.clone();
-        let lines_group = lines_group.clone();
-        let labels = labels.clone();
-        let dialog = dialog.clone();
-        refresh_button.connect_clicked(move |_| {
+    refresh_button.connect_clicked(gtk::glib::clone!(
+        #[weak]
+        overlay,
+        #[weak]
+        lines_group,
+        #[strong]
+        labels,
+        #[weak]
+        dialog,
+        move |button| {
+            button.set_sensitive(false);
+            let button = button.clone();
             let overlay = overlay.clone();
             let lines_group = lines_group.clone();
             let labels = labels.clone();
@@ -151,6 +166,7 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
             spawn(async move {
                 let before = JELLYFIN_CLIENT.line_statuses().len();
                 let statuses = spawn_tokio(async { JELLYFIN_CLIENT.refresh_lines().await }).await;
+                button.set_sensitive(true);
                 rebuild_rows(&lines_group, &labels, &overlay, &dialog);
                 let added = statuses.len().saturating_sub(before);
                 if added == 0 {
@@ -162,7 +178,14 @@ pub fn present(parent: &impl IsA<gtk::Widget>) {
                     );
                 }
             });
-        });
+        }
+    ));
+}
+
+fn clear_rows(group: &adw::PreferencesGroup) {
+    // first_child() is Adwaita's internal container, not a row removable by remove().
+    while let Some(row) = group.row(0) {
+        group.remove(&row);
     }
 }
 
@@ -170,9 +193,7 @@ fn rebuild_rows(
     group: &adw::PreferencesGroup, labels: &LatencyLabels, overlay: &adw::ToastOverlay,
     dialog: &adw::Dialog,
 ) {
-    while let Some(child) = group.first_child() {
-        group.remove(&child);
-    }
+    clear_rows(group);
     labels.borrow_mut().clear();
 
     let statuses = JELLYFIN_CLIENT.line_statuses();
@@ -220,29 +241,32 @@ fn build_row(
     row.set_activatable(!status.current);
     {
         let url = status.url.clone();
-        let overlay = overlay.clone();
-        let dialog = dialog.clone();
-        let row_clone = row.clone();
-        row.connect_activated(move |_| {
-            let url = url.clone();
-            let overlay = overlay.clone();
-            let dialog = dialog.clone();
-            let row = row_clone.clone();
-            // Show that something is happening before the probe completes.
-            row.set_sensitive(false);
-            spawn(async move {
-                let result =
-                    spawn_tokio(async move { JELLYFIN_CLIENT.switch_line(&url).await }).await;
-                row.set_sensitive(true);
-                match result {
-                    Ok(()) => {
-                        toast(&overlay, gettext("Line switched"));
-                        dialog.force_close();
+        row.connect_activated(gtk::glib::clone!(
+            #[weak]
+            overlay,
+            #[weak]
+            dialog,
+            move |row| {
+                let url = url.clone();
+                let overlay = overlay.clone();
+                let dialog = dialog.clone();
+                let row = row.clone();
+                // Show that something is happening before the probe completes.
+                row.set_sensitive(false);
+                spawn(async move {
+                    let result =
+                        spawn_tokio(async move { JELLYFIN_CLIENT.switch_line(&url).await }).await;
+                    row.set_sensitive(true);
+                    match result {
+                        Ok(()) => {
+                            toast(&overlay, gettext("Line switched"));
+                            dialog.force_close();
+                        }
+                        Err(e) => toast(&overlay, e.to_string()),
                     }
-                    Err(e) => toast(&overlay, e.to_string()),
-                }
-            });
-        });
+                });
+            }
+        ));
     }
 
     row
@@ -274,4 +298,48 @@ fn image(icon: &str) -> gtk::Image {
     let image = gtk::Image::from_icon_name(icon);
     image.set_accessible_role(gtk::AccessibleRole::Presentation);
     image
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "GTK needs a separate process; run this test alone with --ignored"]
+    fn rows_can_be_rebuilt_and_released() {
+        adw::init().expect("GTK test display must be available");
+        let group = adw::PreferencesGroup::new();
+        let labels: LatencyLabels = Rc::default();
+        let overlay = adw::ToastOverlay::new();
+        let dialog = adw::Dialog::new();
+
+        for _ in 0..3 {
+            let row = build_row(
+                LineStatus {
+                    url: "https://server.example/emby/".into(),
+                    label: "Test line".into(),
+                    current: false,
+                    preferred: false,
+                    latency_ms: None,
+                },
+                &labels,
+                &overlay,
+                &dialog,
+            );
+            let weak = row.downgrade();
+            group.add(&row);
+            drop(row);
+            assert!(group.row(0).is_some());
+            clear_rows(&group);
+            labels.borrow_mut().clear();
+            assert!(group.row(0).is_none());
+            assert!(
+                weak.upgrade().is_none(),
+                "row signal must not retain itself"
+            );
+        }
+        // Empty groups still have an internal first_child; clearing must return.
+        assert!(group.first_child().is_some());
+        clear_rows(&group);
+    }
 }

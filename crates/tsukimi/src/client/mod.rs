@@ -5,6 +5,7 @@ pub mod jellyfin_client;
 pub mod picture_source;
 pub mod proxy;
 pub mod runtime;
+pub(crate) mod stream_url;
 pub mod structs;
 
 pub use account::Account;

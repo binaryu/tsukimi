@@ -19,7 +19,6 @@ use gtk::{
 };
 use itertools::Itertools;
 use mutsumi::*;
-use url::Url;
 
 use super::{
     DanmakuPopoverStatus,
@@ -34,6 +33,10 @@ use crate::{
         jellyfin_client::{
             BackType,
             JELLYFIN_CLIENT,
+        },
+        stream_url::{
+            MediaSourceFallback,
+            media_source_url,
         },
         structs::{
             Back,
@@ -98,11 +101,6 @@ impl MpvTrackKind {
             Self::Subtitle => "sid",
         }
     }
-}
-
-enum MediaSourceFallback {
-    DirectPlay(String),
-    PlaybackInfo,
 }
 
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -893,7 +891,7 @@ impl MPVPage {
                 imp.suburl.replace(sub_url);
 
                 let Some((primary_url, fallback)) =
-                    media_source_url(media_source, playback_info.play_session_id.as_deref())
+                    media_source_url(media_source, &id, playback_info.play_session_id.as_deref())
                 else {
                     obj.fail_playback(gettext("No media source found"));
                     return;
@@ -2019,56 +2017,4 @@ fn media_stream_by_index(source: &MediaSource, index: i64) -> Option<&MediaStrea
                 .ok()
                 .and_then(|index| source.media_streams.get(index))
         })
-}
-
-fn direct_play_url(source: &MediaSource, play_session_id: Option<&str>) -> Option<String> {
-    let container = source.container.as_deref()?;
-    JELLYFIN_CLIENT
-        .get_item_direct_play_url(
-            container,
-            source.item_id.as_ref().unwrap_or(&source.id),
-            &source.id,
-            play_session_id,
-        )
-        .ok()
-}
-
-/// Servers such as the emos proxy only serve signed, server-generated stream
-/// URLs: a self-built `Videos/{id}/stream.{container}` request always answers
-/// 404. Such URLs carry their own credentials (`token`/`sign`), which is
-/// required anyway since mpv gets no auth headers. Plain Jellyfin/Emby
-/// `DirectStreamUrl` values without credentials are ignored so the regular
-/// URL builder keeps being used for them.
-fn signed_direct_stream_url(source: &MediaSource) -> Option<String> {
-    let url = source.direct_stream_url.as_deref()?.trim();
-    [
-        "api_key=", "ApiKey=", "apiKey=", "token=", "Token=", "sign=",
-    ]
-    .iter()
-    .any(|needle| url.contains(needle))
-    .then(|| url.to_owned())
-}
-
-fn media_source_url(
-    source: &MediaSource, play_session_id: Option<&str>,
-) -> Option<(String, Option<MediaSourceFallback>)> {
-    if let Some(path) = source.path.as_deref()
-        && Url::parse(path).is_ok()
-    {
-        let fallback = if source.live_stream_id.is_some() {
-            Some(MediaSourceFallback::PlaybackInfo)
-        } else {
-            direct_play_url(source, play_session_id).map(MediaSourceFallback::DirectPlay)
-        };
-        return Some((path.to_owned(), fallback));
-    }
-
-    if let Some(url) = signed_direct_stream_url(source) {
-        // Keep the regular URL builder around as a second chance.
-        let fallback =
-            direct_play_url(source, play_session_id).map(MediaSourceFallback::DirectPlay);
-        return Some((url, fallback));
-    }
-
-    direct_play_url(source, play_session_id).map(|url| (url, None))
 }

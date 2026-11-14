@@ -206,6 +206,38 @@
                                               </object>
                                             </child>
                                             <child>
+                                              <object class="GtkMenuButton" id="external_playback">
+                                                <property name="icon-name">video-x-generic-symbolic</property>
+                                                <property name="tooltip-text" translatable="yes">External playback</property>
+                                                <property name="sensitive" bind-source="playbutton" bind-property="sensitive" bind-flags="sync-create"/>
+                                                <property name="popover">
+                                                  <object class="GtkPopover">
+                                                    <property name="child">
+                                                      <object class="GtkBox">
+                                                        <property name="orientation">vertical</property>
+                                                        <property name="spacing">6</property>
+                                                        <child>
+                                                          <object class="GtkButton">
+                                                            <property name="label" translatable="yes">Copy playback link</property>
+                                                            <signal name="clicked" handler="copy_stream_url_cb" swapped="yes"/>
+                                                          </object>
+                                                        </child>
+                                                        <child>
+                                                          <object class="GtkButton">
+                                                            <property name="label" translatable="yes">Open in external player</property>
+                                                            <signal name="clicked" handler="open_external_player_cb" swapped="yes"/>
+                                                          </object>
+                                                        </child>
+                                                        <style>
+                                                          <class name="menu"/>
+                                                        </style>
+                                                      </object>
+                                                    </property>
+                                                  </object>
+                                                </property>
+                                              </object>
+                                            </child>
+                                            <child>
                                               <object class="ItemActionsBox" id="actionbox">
                                                 <property name="is-playable">True</property>
                                               </object>
